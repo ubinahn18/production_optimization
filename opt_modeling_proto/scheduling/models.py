@@ -86,12 +86,12 @@ class Order:
 @dataclass
 class LinePool:
     """물리적으로 동일한(=모든 주문에 대해 rate/workers가 완전히 같은) 라인들의
-    묶음. 대수가 많아지면(예: 동일 라인 19대) 라인별로 변수를 따로 만드는
-    기존 방식은 물리 라인들 사이의 symmetry(어느 카피가 뭘 하든 목적함수상
-    동등함) 때문에 CP-SAT이 최적성 증명에 엄청난 시간을 쓰게 된다.
-    solver.py는 pool.k가 ScheduleConfig.pooling_min_group_size보다 큰
-    그룹만 이 풀링된 집계변수 방식으로 풀고(scheduling/pooling.py 참고),
-    작은 그룹(기본 3대 이하)은 기존 라인별 변수 방식을 그대로 쓴다.
+    묶음. 물리 라인이 하나뿐이면 k=1짜리 풀이 된다. 라인별로 변수를 따로
+    만드는 대신 "이 슬롯에 이 그룹의 몇 대가 무슨 상태인가"라는 집계
+    정수 변수로 모델링하면(scheduling/solver.py, scheduling/pooling.py
+    참고), 동일 라인이 여러 대 있을 때 생기는 symmetry(어느 물리 카피가
+    뭘 하든 목적함수상 동등해서, 대수가 많아지면(예: 19대) CP-SAT이
+    최적성 증명에 엄청난 시간을 쓰게 되는 문제)가 애초에 생기지 않는다.
     """
 
     member_line_ids: list[str]
@@ -134,12 +134,6 @@ class ScheduleConfig:
     # 된다 - --backlog-cost CLI 옵션이나 Order.backlog_cost_per_unit_per_day로
     # 전역/주문별로 둘 다 조정 가능.
     default_backlog_cost_per_unit_per_day: float = 20.0
-
-    # 동일 물리 라인 그룹의 대수(k)가 이 값보다 큰 그룹만 풀링(pooled 집계
-    # 변수) 방식으로 모델링한다. 이 값 이하인 그룹(예시 데이터의 최대 2대짜리
-    # 그룹들)은 기존 라인별 변수 방식을 그대로 써서, 소규모에서는 결과가
-    # 기존과 완전히 동일하게 유지된다. scheduling/pooling.py 참고.
-    pooling_min_group_size: int = 3
 
     def resolved_hourly_wage(self) -> float:
         return self.hourly_wage if self.hourly_wage is not None else self.daily_wage / 8.0

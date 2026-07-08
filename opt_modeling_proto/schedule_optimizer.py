@@ -90,11 +90,6 @@ def main():
     )
     parser.add_argument("--no-plot", action="store_true", help="간트 차트 PNG 생성 생략")
     parser.add_argument(
-        "--pooling-min-group-size", type=int, default=3,
-        help="동일 라인 그룹의 대수(k)가 이 값보다 큰 그룹만 풀링(집계 변수) 방식으로 모델링. "
-             "0으로 주면 크기 1짜리 그룹까지 전부 풀링 방식을 쓴다(legacy 라인별 방식 미사용).",
-    )
-    parser.add_argument(
         "--output-dir",
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "output"),
     )
@@ -116,7 +111,6 @@ def main():
         secondary_time_limit_seconds=args.secondary_time_limit,
         optimize_continuity=not args.no_continuity,
         default_backlog_cost_per_unit_per_day=args.backlog_cost,
-        pooling_min_group_size=args.pooling_min_group_size,
     )
     print(
         f"[정보] 임금 설정: 일급 {config.daily_wage:,.0f} / 시급(잔업기준) "
