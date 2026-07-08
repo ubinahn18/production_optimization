@@ -300,18 +300,26 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
         produced_qty[oid] = pv
 
     # ------------------------------------------------------------------
-    # ASAP 주문의 backlog(미생산 잔량) 비용 집계.
-    #   매일(day) 끝난 시점까지의 누적생산량을 구해서, 그날그날 "아직 못
-    #   만든 수량"(backlog)을 계산하고, 그 수량 x 하루당 지연비용을
-    #   목적함수에 더한다. 하루하루 쌓이는 방식이라, 예를 들어 5000개가
-    #   3일 밀리면 하루 1000개 밀린 것보다 훨씬 더 비싸진다(끝나는 날짜
-    #   자체보다 "얼마나 오래, 얼마나 많이 밀려있었는지"의 누적을
-    #   반영하기 위함 - 재고관리/생산계획에서 쓰는 표준적인 backlog cost
-    #   방식이다).
-    #   day_prod[oid,d]는 그날(local slot 0~9) 하루치 생산량, cum_prod는
-    #   그날까지의 누적생산량, backlog[oid,d] >= quantity - cum_prod[oid,d]
-    #   (0 미만으로는 안 내려가게 하한만 걸고, 목적함수가 backlog를
-    #   최소화하려 하므로 정확히 max(0, ...)로 수렴한다).
+    # ASAP 주문의 backlog(진도 지연) 비용 집계.
+    #
+    #   처음엔 "그날까지 못 만든 전체 잔량"(quantity - 누적생산량)을
+    #   그대로 backlog로 썼는데, 이러면 계획 첫날부터 "아직 하나도 안
+    #   만들었으니 backlog = quantity 전체"가 되어 버려서, 솔버가 그
+    #   페널티를 줄이려고 계획 첫 며칠에 인원을 몰아넣고 여러 라인을
+    #   동시에 돌려 무리하게 전량을 앞당겨 만들어버리는 부작용이 있었다
+    #   (실제로 확인된 문제).
+    #
+    #   대신 "계획기간 내내 매일 똑같은 양씩 만들어서 마지막 날에 정확히
+    #   다 끝낸다"는 가상의 선형 목표 진도(expected_cum)를 날짜별로 잡고,
+    #   그 목표보다 실제 누적생산량이 뒤처진 만큼만 backlog로 잡는다.
+    #     expected_cum[d] = quantity * (d+1) / horizon_days  (반올림)
+    #     backlog[d] = max(0, expected_cum[d] - 실제 누적생산량[d])
+    #   이러면 계획 첫날의 목표치 자체가 quantity/horizon_days 정도로
+    #   작으니, 하루이틀 늦어도 큰 페널티가 안 붙고, 목표 진도보다
+    #   앞서가는 건(초과생산) 아무 페널티가 없다(음수가 안 되게 0에서
+    #   막아둠). 계획 마지막 날(d=horizon_days-1)엔 expected_cum이
+    #   정확히 quantity와 같아지므로, 최종적으로 다 못 만들었으면 그만큼
+    #   그대로 backlog로 잡혀서 "결국 못 끝낸 양"도 여전히 놓치지 않는다.
     # ------------------------------------------------------------------
     backlog_cost_terms: list[tuple[cp_model.IntVar, float]] = []
     backlog_by_order_day: dict[tuple[str, int], cp_model.IntVar] = {}  # (oid, d) -> backlog var, 리포트용
@@ -335,6 +343,12 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
         max_rate_sum = sum(int(round(o.rate[lid])) for lid in compat)
         cum_upper_bound = max(max_rate_sum * T + 1, o.quantity)
 
+        # 날짜별 선형 목표 진도. d=horizon_days-1(마지막 날)에는 정확히
+        # o.quantity가 되도록 반올림한다.
+        expected_cum = [
+            int(round(o.quantity * (d + 1) / horizon_days)) for d in range(horizon_days)
+        ]
+
         prev_cum_var = None
         for d in range(horizon_days):
             day_start_t = d * SLOTS_PER_DAY
@@ -355,7 +369,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
             prev_cum_var = cum_var
 
             bl = model.NewIntVar(0, o.quantity, f"backlog[{oid},{d}]")
-            model.Add(bl >= o.quantity - cum_var)
+            model.Add(bl >= expected_cum[d] - cum_var)
             backlog_cost_terms.append((bl, rate_per_day))
             backlog_by_order_day[oid, d] = bl
 
