@@ -46,7 +46,7 @@ from .models import (
     ScheduleConfig,
     ScheduleResult,
 )
-from .pooling import detect_line_pools, reconstruct_physical_schedule
+from .pooling import build_line_pools, reconstruct_physical_schedule
 
 
 def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConfig) -> ScheduleResult:
@@ -60,15 +60,21 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
     model = cp_model.CpModel()
 
     # ------------------------------------------------------------------
-    # 동일 물리 라인 그룹(모든 주문에 대해 rate/workers가 완전히 같은
-    # 라인들) 탐지. 물리 라인이 하나뿐인 "그룹"도 k=1짜리 풀로 취급해서
-    # 전부 같은 방식(집계 카운트)으로 모델링한다.
+    # 각 라인 타입(Line.count대)을 풀(LinePool)로 변환. 물리 라인이
+    # 하나뿐인 타입(count=1)도 k=1짜리 풀로 취급해서 전부 같은 방식
+    # (집계 카운트)으로 모델링한다.
     # ------------------------------------------------------------------
-    pools: list[LinePool] = detect_line_pools(lines, orders)
-    line_to_pool: dict[str, LinePool] = {lid: p for p in pools for lid in p.member_line_ids}
+    pools: list[LinePool] = build_line_pools(lines, orders)
+    # build_line_pools()는 lines와 1:1 순서로 풀을 만들어내므로(라인
+    # 타입 하나 = 풀 하나), zip으로 그대로 짝지을 수 있다. 이 딕셔너리의
+    # 키는 물리 라인 라벨(member_line_ids, 예: "line_mask_3_1")이 아니라
+    # 라인 "타입" id(Line.line_id, 예: "line_mask_3")다 - Order.rate/
+    # workers가 이제 타입 id로만 키가 잡혀 있으므로(compatible_lines()도
+    # 타입 id 목록을 돌려줌), 여기서도 타입 id 기준으로 찾아야 한다.
+    line_to_pool: dict[str, LinePool] = {line.line_id: pool for line, pool in zip(lines, pools)}
 
     def compat_pools_for(compat_line_ids: list[str]) -> list[LinePool]:
-        """주문의 호환 라인 목록(compatible_lines())이 속한 풀들을
+        """주문의 호환 라인 타입 목록(compatible_lines())이 속한 풀들을
         중복 없이 뽑는다."""
         seen_keys: set[int] = set()
         result: list[LinePool] = []
@@ -183,7 +189,6 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
                 model.Add(cfg == inf + pnf + su + pf)
                 # 셋업 공급은 "oid로 이미 설정되지 않은 non-fresh 대수"로
                 # 제한(같은 제품으로 또 셋업하는 무의미한 self-loop 방지).
-                #
                 # 주의: 이 부등식은 prev_cfg(전날 끝 시점의 설정 상태)가
                 # nfr(오늘 시작 시점의 fresh 대수)와 "같은 모집단"을
                 # 가리킬 때만 유효하다 - 즉 t==0이거나 하루 중간(local!=0)
@@ -227,7 +232,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
     #   ASAP 주문(deadline_day=None): 하드 수량 제약을 아예 걸지 않는다.
     #   대신 아래 backlog 비용 섹션에서 "늦게 끝날수록 손해"를 목적함수에
     #   반영해서, 완료 시점을 하드 제약이 아니라 비용 트레이드오프로
-    #   다룬다(이 파일 상단 docstring 및 Order.deadline_day 설명 참고).
+    #   다룬다(docstring 및 Order.deadline_day 참고).
     # ------------------------------------------------------------------
     produced_qty: dict[str, cp_model.IntVar] = {}
     for o in orders:
@@ -293,8 +298,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
         backlog_rate_by_order[oid] = rate_per_day
 
         # 필요수량을 다 채운 뒤에도 그 라인이 이 제품을 계속 만들지 말라는
-        # 보장은 없으므로(그럴 이유는 없지만 하드 제약으로 막아두진
-        # 않았다), 누적생산량 변수의 상한을 quantity가 아니라 '이론상
+        # 보장은 없으므로, 누적생산량 변수의 상한을 quantity가 아니라 '이론상
         # 30일 내내 이 제품만 만들었을 때의 최대치'로 넉넉하게 잡는다
         # (quantity로 좁게 잡으면 실제로 그보다 더 생산하는 해에서
         # INFEASIBLE이 나버린다).

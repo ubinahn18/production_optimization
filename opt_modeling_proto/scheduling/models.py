@@ -31,9 +31,16 @@ MONEY_SCALE = 100
 # ----------------------------------------------------------------------
 @dataclass
 class Line:
-    """물리적으로 독립된 생산라인 하나. 같은 라인 타입의 동일 설비가 여러
-    대 있으면(예: line_mask_3가 4대) 이 클래스 인스턴스를 4개 만들어서
-    각각 독립 라인으로 취급한다 (expand_line_types() 참고).
+    """생산라인 "타입" 하나. 물리적으로 동일한 설비가 여러 대 있으면(예:
+    line_mask_3가 2대) 인스턴스를 여러 개 만드는 게 아니라 count에 그
+    대수를 직접 적는다 - 동일 설비는 어차피 rate/workers가 모두 같으므로
+    Order.rate/workers에도 이 line_id 하나로 한 번만 값을 적으면 된다
+    (물리 라인 개수(count)만큼 값을 중복 입력할 필요가 없다).
+
+    물리 라인별 라벨(리포트/CSV에 찍히는 line_id, 예: "line_mask_3_1",
+    "line_mask_3_2")은 count>1일 때 solver가 내부적으로("{line_id}_1"..
+    "{line_id}_{count}") 붙여서 생성한다(scheduling/pooling.py의
+    build_line_pools 참고) - 입력 데이터 단계에서는 신경 쓸 필요 없다.
     """
 
     line_id: str
@@ -41,6 +48,7 @@ class Line:
                     # 가능 여부는 Order.rate에 그 라인이 등록되어 있고 값이
                     # 0보다 큰지로 판단하므로, category가 달라도 rate만
                     # 맞으면 모델상으로는 생산 가능하다.
+    count: int = 1  # 이 타입의 물리 설비 대수. 1이면 그냥 라인 하나.
 
 
 @dataclass
@@ -85,13 +93,15 @@ class Order:
 
 @dataclass
 class LinePool:
-    """물리적으로 동일한(=모든 주문에 대해 rate/workers가 완전히 같은) 라인들의
-    묶음. 물리 라인이 하나뿐이면 k=1짜리 풀이 된다. 라인별로 변수를 따로
-    만드는 대신 "이 슬롯에 이 그룹의 몇 대가 무슨 상태인가"라는 집계
-    정수 변수로 모델링하면(scheduling/solver.py, scheduling/pooling.py
-    참고), 동일 라인이 여러 대 있을 때 생기는 symmetry(어느 물리 카피가
-    뭘 하든 목적함수상 동등해서, 대수가 많아지면(예: 19대) CP-SAT이
-    최적성 증명에 엄청난 시간을 쓰게 되는 문제)가 애초에 생기지 않는다.
+    """Line 하나(그 line_id의 count대 전체)에 대응하는, 풀이에 필요한
+    정보를 다 모아둔 구조(물리 라인 라벨 목록 + 호환 주문의 rate/workers).
+    scheduling/pooling.py의 build_line_pools()가 Line/Order로부터 만든다.
+    물리 라인이 하나뿐이면(count=1) k=1짜리 풀이 된다. 라인별로 변수를
+    따로 만드는 대신 "이 슬롯에 이 그룹의 몇 대가 무슨 상태인가"라는
+    집계 정수 변수로 모델링하면(scheduling/solver.py 참고), 동일 라인이
+    여러 대 있을 때 생기는 symmetry(어느 물리 카피가 뭘 하든 목적함수상
+    동등해서, 대수가 많아지면(예: 19대) CP-SAT이 최적성 증명에 엄청난
+    시간을 쓰게 되는 문제)가 애초에 생기지 않는다.
     """
 
     member_line_ids: list[str]
@@ -137,25 +147,6 @@ class ScheduleConfig:
 
     def resolved_hourly_wage(self) -> float:
         return self.hourly_wage if self.hourly_wage is not None else self.daily_wage / 8.0
-
-
-def expand_line_types(spec: list[tuple[str, str, int]]) -> list[Line]:
-    """(line_type_id, category, 대수) 목록을 물리적으로 독립된 Line 객체
-    목록으로 펼친다. 대수가 1이면 line_type_id를 그대로 쓰고, 2대 이상이면
-    'line_type_id_1', 'line_type_id_2', ... 로 각각 별도 라인을 만든다.
-
-    예) ("line_mask_3", "mask", 4) -> line_mask_3_1 ~ line_mask_3_4 (4개의
-    독립 라인). 문제 설명의 "각 물리 설비는 독립된 생산라인으로 취급한다"는
-    요구사항을 그대로 구현한 것.
-    """
-    lines: list[Line] = []
-    for type_id, category, count in spec:
-        if count <= 1:
-            lines.append(Line(line_id=type_id, category=category))
-        else:
-            for i in range(1, count + 1):
-                lines.append(Line(line_id=f"{type_id}_{i}", category=category))
-    return lines
 
 
 # ----------------------------------------------------------------------
