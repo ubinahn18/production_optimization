@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
-output/
+**/output/*.csv
+**/output/*.png
+**/output/*.json
+**/output/real_plan/*.csv
+**/output/real_plan/*.png

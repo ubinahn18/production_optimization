@@ -67,14 +67,14 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
     pools: list[LinePool] = build_line_pools(lines, orders)
     # build_line_pools()는 lines와 1:1 순서로 풀을 만들어내므로(라인
     # 타입 하나 = 풀 하나), zip으로 그대로 짝지을 수 있다. 이 딕셔너리의
-    # 키는 물리 라인 라벨(member_line_ids, 예: "line_mask_3_1")이 아니라
-    # 라인 "타입" id(Line.line_id, 예: "line_mask_3")다 - Order.rate/
-    # workers가 이제 타입 id로만 키가 잡혀 있으므로(compatible_lines()도
+    # 키는 물리 라인 라벨(LinePool.line_ids, 예: "line_mask_3_1")이 아니라
+    # 라인 "타입" id(Line.line_type_id, 예: "line_mask_3")다 - Order.rate/
+    # workers가 이제 타입 id로만 키가 잡혀 있으므로(compatible_line_types()도
     # 타입 id 목록을 돌려줌), 여기서도 타입 id 기준으로 찾아야 한다.
-    line_to_pool: dict[str, LinePool] = {line.line_id: pool for line, pool in zip(lines, pools)}
+    line_to_pool: dict[str, LinePool] = {line.line_type_id: pool for line, pool in zip(lines, pools)}
 
     def compat_pools_for(compat_line_ids: list[str]) -> list[LinePool]:
-        """주문의 호환 라인 타입 목록(compatible_lines())이 속한 풀들을
+        """주문의 호환 라인 타입 목록(compatible_line_types())이 속한 풀들을
         중복 없이 뽑는다."""
         seen_keys: set[int] = set()
         result: list[LinePool] = []
@@ -135,7 +135,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
     }
 
     for p in pools:
-        pkey = tuple(p.member_line_ids)
+        pkey = tuple(p.line_ids)
         k = p.k
         for t in range(T):
             local = t % SLOTS_PER_DAY
@@ -237,7 +237,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
     produced_qty: dict[str, cp_model.IntVar] = {}
     for o in orders:
         oid = o.order_id
-        compat = o.compatible_lines()
+        compat = o.compatible_line_types()
         if not compat:
             raise ValueError(f"주문 {oid}({o.product_id})를 생산할 수 있는 라인이 없습니다(rate가 전부 0/미지정).")
 
@@ -249,7 +249,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
 
         terms = []
         for p in compat_pools_for(compat):
-            pkey = tuple(p.member_line_ids)
+            pkey = tuple(p.line_ids)
             rate_val = int(round(p.rate[oid]))
             if rate_val <= 0:
                 continue
@@ -291,7 +291,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
         if not o.is_asap():
             continue
         oid = o.order_id
-        compat = o.compatible_lines()
+        compat = o.compatible_line_types()
         rate_per_day = o.backlog_cost_per_unit_per_day
         if rate_per_day is None:
             rate_per_day = config.default_backlog_cost_per_unit_per_day
@@ -318,7 +318,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
             day_start_t = d * SLOTS_PER_DAY
             day_terms = []
             for p in compat_pools:
-                pkey = tuple(p.member_line_ids)
+                pkey = tuple(p.line_ids)
                 rate_val = int(round(p.rate[oid]))
                 if rate_val <= 0:
                     continue
@@ -359,7 +359,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
     for t in range(T):
         terms = []
         for p in pools:
-            pkey = tuple(p.member_line_ids)
+            pkey = tuple(p.line_ids)
             for oid in p.compat_order_ids:
                 w = int(p.workers.get(oid, 0))
                 if w <= 0:
@@ -491,7 +491,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
 
         pool_switch_terms = []
         for p in pools:
-            pkey = tuple(p.member_line_ids)
+            pkey = tuple(p.line_ids)
             for t in range(1, T):
                 sw = model.NewIntVar(0, p.k, f"poolIdleSwitch[{pkey[0]},{t}]")
                 model.Add(sw >= n_idle_pool[pkey, t] - n_idle_pool[pkey, t - 1])
@@ -578,9 +578,9 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
     }
 
     order_id_to_product = {o.order_id: o.product_id for o in orders}
-    line_activity: dict[str, list[tuple[int, str, str]]] = {}
+    line_activity: dict[str, list[tuple[int, str, str, str]]] = {}
     for p in pools:
-        pkey = tuple(p.member_line_ids)
+        pkey = tuple(p.line_ids)
         pool_snapshot = {
             "idle_fresh": {t: best_snapshot["idle_fresh"][pkey, t] for t in range(T)},
             "prod_fresh": {
@@ -607,7 +607,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
     order_fulfillment = {}
     for o in orders:
         oid = o.order_id
-        compat = o.compatible_lines()
+        compat = o.compatible_line_types()
         compat_pools = compat_pools_for(compat)
         # 마감일 완료 여부와 별개로, '언제 누적 생산량이 필요수량에 처음
         # 도달했는지'(완료일)를 슬롯 단위로 다시 훑어서 계산한다.
@@ -615,7 +615,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
         completion_day = None
         for t in range(T):
             for p in compat_pools:
-                pkey = tuple(p.member_line_ids)
+                pkey = tuple(p.line_ids)
                 n = best_snapshot["prod_fresh"][pkey, t, oid] + best_snapshot["prod_nf"][pkey, t, oid]
                 if n:
                     cumulative += int(round(p.rate[oid])) * n

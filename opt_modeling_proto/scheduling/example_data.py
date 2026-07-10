@@ -18,18 +18,18 @@ def build_example_instance() -> tuple[list[Line], list[Order]]:
     line_mask_3와 line_container_1은 물리 설비가 2대씩(count=2)이라
     '동일 라인타입의 여러 대 = 독립 라인' 요구사항을 보여준다. 동일
     라인타입 내 물리 라인들은 rate/workers가 항상 같으므로, 주문의
-    rate/workers 딕셔너리에도 line_id(타입 id)당 값을 한 번만 적으면
+    rate/workers 딕셔너리에도 line_type_id당 값을 한 번만 적으면
     된다 - count대만큼 중복 입력할 필요가 없다(scheduling/models.py의
     Line.count, scheduling/pooling.py의 build_line_pools 참고).
     실제 데이터로 돌리려면 --data로 이런 구조의 JSON을 넣으면 된다
     (load_data_from_json 참고).
     """
     lines = [
-        Line(line_id="line_mask_1", category="mask", count=1),       # 로타리형: 속도 빠름, 인원 多
-        Line(line_id="line_mask_2", category="mask", count=1),       # 단발형: 속도 느림, 인원 少
-        Line(line_id="line_mask_3", category="mask", count=2),       # 셀라인형: 동일 설비 2대
-        Line(line_id="line_container_1", category="container", count=2),
-        Line(line_id="line_tube_1", category="tube", count=1),
+        Line(line_type_id="line_mask_1", category="mask", count=1),       # 로타리형: 속도 빠름, 인원 多
+        Line(line_type_id="line_mask_2", category="mask", count=1),       # 단발형: 속도 느림, 인원 少
+        Line(line_type_id="line_mask_3", category="mask", count=2),       # 셀라인형: 동일 설비 2대
+        Line(line_type_id="line_container_1", category="container", count=2),
+        Line(line_type_id="line_tube_1", category="tube", count=1),
     ]
 
     orders = [
@@ -86,18 +86,18 @@ def load_data_from_json(path: str) -> tuple[list[Line], list[Order]]:
 
     JSON 형식:
       {
-        "lines": [{"line_id": "...", "category": "mask", "count": 2}, ...],
+        "lines": [{"line_type_id": "...", "category": "mask", "count": 2}, ...],
         "orders": [
           {"order_id": "...", "product_id": "...", "category": "mask",
            "quantity": 10000, "deadline_day": 12,
-           "rate": {"line_id(타입 id)": 시간당수량, ...},
-           "workers": {"line_id(타입 id)": 필요인원, ...}},
+           "rate": {"line_type_id": 시간당수량, ...},
+           "workers": {"line_type_id": 필요인원, ...}},
           ...
         ]
       }
 
     "count"는 생략하면 1(라인 1대)로 취급된다. 동일 물리 라인이 여러 대면
-    rate/workers는 그 line_id에 대해 한 번만 적으면 되고(count대 전부에
+    rate/workers는 그 line_type_id에 대해 한 번만 적으면 되고(count대 전부에
     동일하게 적용됨), count대만큼 값을 중복 입력할 필요는 없다 - 물리
     라인별 라벨은 solver가 내부적으로 생성한다(scheduling/pooling.py의
     build_line_pools 참고).

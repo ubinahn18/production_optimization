@@ -14,24 +14,28 @@ import os
 from .models import SLOTS_PER_DAY, Order, ScheduleConfig, ScheduleResult
 
 
-def _compress_runs(entries: list[tuple[int, str, str]]) -> list[tuple[int, str, int, str, str]]:
-    """(day, slot_label, activity) 슬롯별 리스트를, 연속으로 같은 activity가
-    이어지는 구간을 하나로 뭉쳐서 (시작일, 시작슬롯, 끝일, 끝슬롯, activity)
-    형태로 압축한다. 300줄짜리 슬롯 로그를 사람이 읽을 수 있는 요약으로
-    바꾸기 위한 용도(요청받은 적은 없지만, 콘솔에 300줄을 그대로 뿌리면
-    아무도 못 읽으므로 가독성을 위해 추가).
+def _compress_runs(entries: list[tuple[int, str, str, str]]) -> list[tuple[int, str, int, str, str, str]]:
+    """(day, slot_label, activity, order_id) 슬롯별 리스트를, 연속으로 같은
+    (activity, order_id)가 이어지는 구간을 하나로 뭉쳐서 (시작일, 시작슬롯,
+    끝일, 끝슬롯, activity, order_id) 형태로 압축한다. 300줄짜리 슬롯
+    로그를 사람이 읽을 수 있는 요약으로 바꾸기 위한 용도(요청받은 적은
+    없지만, 콘솔에 300줄을 그대로 뿌리면 아무도 못 읽으므로 가독성을
+    위해 추가). activity뿐 아니라 order_id도 같이 비교하는 이유: 서로
+    다른 주문이 같은 product_id(예: "코드확인중" 같은 placeholder)를
+    공유하면 activity 문자열만으로는 같은 구간인지 구분이 안 되므로,
+    실제로는 다른 주문인데 하나로 잘못 뭉쳐질 수 있다.
     """
     if not entries:
         return []
     runs = []
-    start_day, start_slot, cur_activity = entries[0]
+    start_day, start_slot, cur_activity, cur_order = entries[0]
     prev_day, prev_slot = start_day, start_slot
-    for day, slot_label, activity in entries[1:]:
-        if activity != cur_activity:
-            runs.append((start_day, start_slot, prev_day, prev_slot, cur_activity))
-            start_day, start_slot, cur_activity = day, slot_label, activity
+    for day, slot_label, activity, order_id in entries[1:]:
+        if activity != cur_activity or order_id != cur_order:
+            runs.append((start_day, start_slot, prev_day, prev_slot, cur_activity, cur_order))
+            start_day, start_slot, cur_activity, cur_order = day, slot_label, activity, order_id
         prev_day, prev_slot = day, slot_label
-    runs.append((start_day, start_slot, prev_day, prev_slot, cur_activity))
+    runs.append((start_day, start_slot, prev_day, prev_slot, cur_activity, cur_order))
     return runs
 
 
@@ -77,8 +81,9 @@ def print_report(result: ScheduleResult, orders: list[Order]):
     for lid, entries in result.line_activity.items():
         runs = _compress_runs(entries)
         print(f"  [{lid}]")
-        for sd, ss, ed, es, activity in runs[:8]:
-            print(f"    {sd}일 {ss} ~ {ed}일 {es} : {activity}")
+        for sd, ss, ed, es, activity, order_id in runs[:8]:
+            suffix = f" ({order_id})" if order_id else ""
+            print(f"    {sd}일 {ss} ~ {ed}일 {es} : {activity}{suffix}")
         if len(runs) > 8:
             print(f"    ... (총 {len(runs)}개 구간, 나머지는 CSV 참고)")
 
@@ -91,11 +96,18 @@ def save_outputs(result: ScheduleResult, orders: list[Order], output_dir: str):
     import pandas as pd
 
     # 1) 라인별 슬롯 단위 전체 스케줄 (가장 상세한 원본 데이터)
+    #    order_id를 같이 저장하는 이유: 서로 다른 주문이 같은 product_id를
+    #    공유할 수 있어서(예: 품번이 아직 안 나온 "코드확인중" 같은
+    #    placeholder를 여러 실제 제품이 같이 씀), product_id만으로는
+    #    어느 주문의 생산/셋업인지 구분이 안 될 수 있다.
     rows = []
     for lid, entries in result.line_activity.items():
-        for day, slot_label, activity in entries:
+        for day, slot_label, activity, order_id in entries:
             kind, _, product = activity.partition(":")
-            rows.append({"line_id": lid, "day": day, "slot": slot_label, "activity": kind, "product_id": product})
+            rows.append({
+                "line_id": lid, "day": day, "slot": slot_label, "activity": kind,
+                "product_id": product, "order_id": order_id,
+            })
     schedule_df = pd.DataFrame(rows)
     schedule_csv = os.path.join(output_dir, "line_schedule.csv")
     schedule_df.to_csv(schedule_csv, index=False, encoding="utf-8-sig")
@@ -103,11 +115,11 @@ def save_outputs(result: ScheduleResult, orders: list[Order], output_dir: str):
     # 2) 라인별 압축된(연속 구간) 스케줄 - 사람이 보기 편한 버전
     run_rows = []
     for lid, entries in result.line_activity.items():
-        for sd, ss, ed, es, activity in _compress_runs(entries):
+        for sd, ss, ed, es, activity, order_id in _compress_runs(entries):
             kind, _, product = activity.partition(":")
             run_rows.append(
                 {"line_id": lid, "start_day": sd, "start_slot": ss, "end_day": ed, "end_slot": es,
-                 "activity": kind, "product_id": product}
+                 "activity": kind, "product_id": product, "order_id": order_id}
             )
     runs_csv = os.path.join(output_dir, "line_schedule_compressed.csv")
     pd.DataFrame(run_rows).to_csv(runs_csv, index=False, encoding="utf-8-sig")
@@ -156,25 +168,47 @@ def plot_gantt(result: ScheduleResult, orders: list[Order], config: ScheduleConf
     plt.rcParams["font.family"] = "Malgun Gothic"
     plt.rcParams["axes.unicode_minus"] = False
 
-    line_ids = list(result.line_activity.keys())
+    # 계획기간 내내 단 한 번도 안 쓰인(전부 idle) 라인은 차트에서 뺀다 -
+    # 동일 라인이 많은 그룹(예: 단발 19대)에서 실제로 쓰인 몇 대만 빼고
+    # 나머지가 전부 회색 idle 줄로 차트를 채워서 정작 중요한 부분이
+    # 안 보이게 되는 걸 막기 위함.
+    line_ids = [
+        lid for lid, entries in result.line_activity.items()
+        if any(activity != "idle" for _, _, activity, _ in entries)
+    ]
     T = config.horizon_days * SLOTS_PER_DAY
-    product_ids = sorted({o.product_id for o in orders})
-    # 0=idle, 1=setup(공통 회색), 2..=제품별 생산 색상
-    product_index = {pid: i + 2 for i, pid in enumerate(product_ids)}
+    # 색상/범례는 order_id(주문) 단위로 나눈다 - product_id는 진짜 식별자가
+    # 아니라 제품 "이름"이라서 여러 주문이 같은 값을 공유할 수 있다(예:
+    # 품번이 아직 안 나온 "코드확인중" 같은 placeholder). product_id로
+    # 색을 나누면 서로 다른 주문들이 같은 색 하나로 뭉개진다.
+    order_ids_present = sorted({o.order_id for o in orders})
+    order_product = {o.order_id: o.product_id for o in orders}
+    # 0=idle, 1=setup(공통 회색), 2..=주문별 생산 색상
+    order_index = {oid: i + 2 for i, oid in enumerate(order_ids_present)}
 
     grid = np.zeros((len(line_ids), T), dtype=int)
     for r, lid in enumerate(line_ids):
-        for t, (day, slot_label, activity) in enumerate(result.line_activity[lid]):
+        for t, (day, slot_label, activity, order_id) in enumerate(result.line_activity[lid]):
             if activity == "idle":
                 grid[r, t] = 0
             elif activity.startswith("setup:"):
                 grid[r, t] = 1
             else:
-                pid = activity.split(":", 1)[1]
-                grid[r, t] = product_index[pid]
+                grid[r, t] = order_index[order_id]
 
-    n_colors = 2 + len(product_ids)
-    base_colors = ["#f2f2f2", "#9e9e9e"] + list(plt.get_cmap("tab20").colors[: len(product_ids)])
+    # tab20 하나로는 20가지 색밖에 없어서, 주문 종류가 그보다 많으면(실제
+    # 수주 데이터에서 흔함) 만들어지는 색상표가 order_ids_present 개수보다
+    # 모자라 ListedColormap이 죽는다. tab20/tab20b/tab20c(총 60색)를
+    # 이어붙이고, 그래도 모자라면(주문 60종 초과) 순환시켜서 항상
+    # len(order_ids_present)개만큼의 색을 확보한다.
+    n_colors = 2 + len(order_ids_present)
+    palette = (
+        list(plt.get_cmap("tab20").colors)
+        + list(plt.get_cmap("tab20b").colors)
+        + list(plt.get_cmap("tab20c").colors)
+    )
+    order_colors = [palette[i % len(palette)] for i in range(len(order_ids_present))]
+    base_colors = ["#f2f2f2", "#9e9e9e"] + order_colors
     cmap = ListedColormap(base_colors)
     bounds = list(range(n_colors + 1))
     norm = BoundaryNorm(bounds, cmap.N)
@@ -211,8 +245,8 @@ def plot_gantt(result: ScheduleResult, orders: list[Order], config: ScheduleConf
 
     legend_items = [Patch(facecolor="#f2f2f2", edgecolor="gray", label="대기(idle)"),
                      Patch(facecolor="#9e9e9e", label="셋업(setup)")]
-    for pid in product_ids:
-        legend_items.append(Patch(facecolor=base_colors[product_index[pid]], label=f"생산: {pid}"))
+    for oid in order_ids_present:
+        legend_items.append(Patch(facecolor=base_colors[order_index[oid]], label=f"생산: {order_product[oid]} [{oid}]"))
     legend_items.append(Line2D([0], [0], color="red", linestyle="--", linewidth=1.3, label="마감일"))
     ax.legend(handles=legend_items, bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
 

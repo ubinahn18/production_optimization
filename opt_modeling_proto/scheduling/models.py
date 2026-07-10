@@ -31,19 +31,25 @@ MONEY_SCALE = 100
 # ----------------------------------------------------------------------
 @dataclass
 class Line:
-    """생산라인 "타입" 하나. 물리적으로 동일한 설비가 여러 대 있으면(예:
-    line_mask_3가 2대) 인스턴스를 여러 개 만드는 게 아니라 count에 그
-    대수를 직접 적는다 - 동일 설비는 어차피 rate/workers가 모두 같으므로
-    Order.rate/workers에도 이 line_id 하나로 한 번만 값을 적으면 된다
-    (물리 라인 개수(count)만큼 값을 중복 입력할 필요가 없다).
+    """생산라인 "타입" 하나 - line_type_id는 물리적으로 유일한 라인을
+    가리키는 게 아니라 "이런 종류의 설비"를 가리키는 이름이다(예:
+    "셀라인"). 물리적으로 동일한 설비가 여러 대 있으면(예: 셀라인이
+    3대) 인스턴스를 여러 개 만드는 게 아니라 count에 그 대수를 직접
+    적는다 - 동일 설비는 어차피 rate/workers가 모두 같으므로
+    Order.rate/workers에도 이 line_type_id 하나로 한 번만 값을 적으면
+    된다(물리 라인 개수(count)만큼 값을 중복 입력할 필요가 없다).
 
-    물리 라인별 라벨(리포트/CSV에 찍히는 line_id, 예: "line_mask_3_1",
-    "line_mask_3_2")은 count>1일 때 solver가 내부적으로("{line_id}_1"..
-    "{line_id}_{count}") 붙여서 생성한다(scheduling/pooling.py의
-    build_line_pools 참고) - 입력 데이터 단계에서는 신경 쓸 필요 없다.
+    실제로 유일한 물리 라인 식별자(리포트/CSV에 찍히는 진짜 line_id,
+    예: "셀라인_1", "셀라인_2")는 count>1일 때 solver가 내부적으로
+    ("{line_type_id}_1".."{line_type_id}_{count}") 붙여서 생성한다
+    (scheduling/pooling.py의 build_line_pools, LinePool.line_ids 참고)
+    - 입력 데이터 단계에서는 신경 쓸 필요 없다. line_type_id 자체는
+    "타입" 이름일 뿐 어느 물리 라인 하나를 가리키지 않으므로 그 자체로는
+    유일하지 않다는 점에 주의(count>1이면 여러 물리 라인이 이 타입을
+    공유함).
     """
 
-    line_id: str
+    line_type_id: str
     category: str  # "mask" / "container" / "tube" - 참고/표시용. 실제 생산
                     # 가능 여부는 Order.rate에 그 라인이 등록되어 있고 값이
                     # 0보다 큰지로 판단하므로, category가 달라도 rate만
@@ -81,11 +87,11 @@ class Order:
         # 못 만든 수량 1개당 이 비용이 목적함수에 더해진다. None이면
         # ScheduleConfig.default_backlog_cost_per_unit_per_day를 대신 쓴다
         # (전역 기본값 하나로 퉁치고, 필요한 주문만 여기서 개별 조정).
-    rate: dict = field(default_factory=dict)     # {line_id: 시간당 생산수량}. 없거나 0이면 그 라인에서 생산 불가.
-    workers: dict = field(default_factory=dict)  # {line_id: 그 라인에서 이 제품 생산/셋업에 필요한 인원}
+    rate: dict = field(default_factory=dict)     # {line_type_id: 시간당 생산수량}. 없거나 0이면 그 라인 타입에서 생산 불가.
+    workers: dict = field(default_factory=dict)  # {line_type_id: 그 라인 타입에서 이 제품 생산/셋업에 필요한 인원}
 
-    def compatible_lines(self) -> list[str]:
-        return [lid for lid, r in self.rate.items() if r and r > 0]
+    def compatible_line_types(self) -> list[str]:
+        return [type_id for type_id, r in self.rate.items() if r and r > 0]
 
     def is_asap(self) -> bool:
         return self.deadline_day is None
@@ -93,8 +99,11 @@ class Order:
 
 @dataclass
 class LinePool:
-    """Line 하나(그 line_id의 count대 전체)에 대응하는, 풀이에 필요한
-    정보를 다 모아둔 구조(물리 라인 라벨 목록 + 호환 주문의 rate/workers).
+    """Line 하나(그 line_type_id의 count대 전체)에 대응하는, 풀이에
+    필요한 정보를 다 모아둔 구조. line_ids가 이 풀에 속한 실제 물리
+    라인들의 진짜(유일한) 식별자 목록이다(예: ["셀라인_1", "셀라인_2",
+    "셀라인_3"]) - Line.line_type_id("셀라인")와 달리 이 목록의 각
+    원소는 물리적으로 유일한 라인 하나씩을 정확히 가리킨다.
     scheduling/pooling.py의 build_line_pools()가 Line/Order로부터 만든다.
     물리 라인이 하나뿐이면(count=1) k=1짜리 풀이 된다. 라인별로 변수를
     따로 만드는 대신 "이 슬롯에 이 그룹의 몇 대가 무슨 상태인가"라는
@@ -104,14 +113,14 @@ class LinePool:
     시간을 쓰게 되는 문제)가 애초에 생기지 않는다.
     """
 
-    member_line_ids: list[str]
+    line_ids: list[str]
     compat_order_ids: list[str]
     rate: dict[str, float]      # order_id -> 시간당 생산수량 (풀 내 모든 라인에 동일)
     workers: dict[str, int]     # order_id -> 필요인원 (풀 내 모든 라인에 동일)
 
     @property
     def k(self) -> int:
-        return len(self.member_line_ids)
+        return len(self.line_ids)
 
 
 @dataclass
@@ -159,7 +168,7 @@ class ScheduleResult:
     total_cost: float | None         # labor_cost + backlog_cost. 1단계 목적함수 값과 동일(비교/최적화 기준용).
     daily_workforce: dict            # {day(1-idx): 그날 고용 인원수}
     overtime_workers: dict           # {day(1-idx): {"17-18": 인원, "18-19": 인원}}
-    line_activity: dict              # {line_id: [(day, slot_label, activity) ...]} (activity: "idle" / "setup:<product_id>" / "produce:<product_id>")
+    line_activity: dict              # {line_id: [(day, slot_label, activity, order_id) ...]} (activity: "idle" / "setup:<product_id>" / "produce:<product_id>"; order_id는 idle이면 "", 아니면 그 activity를 발생시킨 주문. 여러 주문이 같은 product_id를 공유할 수 있어서(예: "코드확인중" 같은 placeholder) product_id만으로는 주문을 구분 못 할 수 있음 - order_id로 구분)
     order_fulfillment: dict          # {order_id: {"required":.., "produced":.., "deadline_day":.., "completion_day":.. or None}}
     continuity_score: int | None = None  # 2단계 목적함수 값(대기<->생산 전환횟수 + 셋업횟수). 작을수록 라인이 안 끊기고 오래 이어짐.
     labor_cost: float | None = None      # 실제로 지급되는 돈: 일일 정액임금 합 + 잔업수당 합 (backlog 비용 제외).

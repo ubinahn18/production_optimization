@@ -28,7 +28,8 @@ from __future__ import annotations
 
 from .models import SLOT_LABELS, SLOTS_PER_DAY, Line, LinePool, Order
 
-
+# 여기서 order의 line type compatibility 와 rate, workers 를 통해 line pool 의 order compatibility 와
+# oid별 rate, workers 를 채우는 것임
 def build_line_pools(lines: list[Line], orders: list[Order]) -> list[LinePool]:
     """각 Line(타입 하나, count대)을 그대로 하나의 LinePool로 바꾼다.
 
@@ -40,35 +41,36 @@ def build_line_pools(lines: list[Line], orders: list[Order]) -> list[LinePool]:
     달라지면 같은 라인인데도 조용히 서로 다른 풀로 쪼개져서 symmetry
     문제가 되살아나는 위험이 있었다). 지금은 Line.count가 "몇 대인지"를
     직접 명시하는 입력값이라 그런 추론/비교가 아예 필요 없다 - 각
-    line_id에 대해 rate/workers를 한 번만 적으면 되고(count대 전부에
-    동일하게 적용됨), 물리 라인 라벨(member_line_ids)은 여기서 그냥
+    line_type_id에 대해 rate/workers를 한 번만 적으면 되고(count대 전부에
+    동일하게 적용됨), 물리 라인 라벨(LinePool.line_ids)은 여기서 그냥
     기계적으로 만들어낸다.
     """
     order_by_id = {o.order_id: o for o in orders}
     pools: list[LinePool] = []
     for line in lines:
-        # 물리 라인 라벨: count==1이면 line_id 그대로(예: "line_tube_1"),
-        # count>1이면 "line_id_1".."line_id_count"(예: "line_mask_3_1",
-        # "line_mask_3_2") - 예전 expand_line_types()가 쓰던 것과 동일한
-        # 명명 규칙이라, 리포트/CSV에 찍히는 물리 라인 라벨 형태는 그대로
-        # 유지된다(하위호환).
-        member_line_ids = (
-            [line.line_id] if line.count <= 1
-            else [f"{line.line_id}_{i}" for i in range(1, line.count + 1)]
+        # 물리 라인 라벨: count==1이면 line_type_id 그대로(예: "line_tube_1"),
+        # count>1이면 "line_type_id_1".."line_type_id_count"(예:
+        # "line_mask_3_1", "line_mask_3_2") - 예전 expand_line_types()가
+        # 쓰던 것과 동일한 명명 규칙이라, 리포트/CSV에 찍히는 물리 라인
+        # 라벨 형태는 그대로 유지된다(하위호환). 이 라벨들만이 진짜로
+        # 유일한 물리 라인 식별자다 - line_type_id 자체는 유일하지 않다.
+        line_ids = (
+            [line.line_type_id] if line.count <= 1
+            else [f"{line.line_type_id}_{i}" for i in range(1, line.count + 1)]
         )
         # compat_order_ids: 이 라인 타입이 생산 가능한 주문 목록. rate가
         # 0이거나 아예 없는 주문은 "이 라인에서 생산 불가"로 간주해서
-        # 제외한다(Order.compatible_lines()와 같은 판단 기준). orders를
+        # 제외한다(Order.compatible_line_types()와 같은 판단 기준). orders를
         # 그대로 순회하되 결과를 order_id로 정렬해서 가독성/재현성을
         # 맞춘다.
         compat_order_ids = sorted(
-            (o.order_id for o in orders if o.rate.get(line.line_id, 0) and o.rate.get(line.line_id, 0) > 0)
+            (o.order_id for o in orders if o.rate.get(line.line_type_id, 0) and o.rate.get(line.line_type_id, 0) > 0)
         )
-        rate = {oid: order_by_id[oid].rate[line.line_id] for oid in compat_order_ids}
-        workers = {oid: int(order_by_id[oid].workers.get(line.line_id, 0)) for oid in compat_order_ids}
+        rate = {oid: order_by_id[oid].rate[line.line_type_id] for oid in compat_order_ids}
+        workers = {oid: int(order_by_id[oid].workers.get(line.line_type_id, 0)) for oid in compat_order_ids}
         pools.append(
             LinePool(
-                member_line_ids=member_line_ids,
+                line_ids=line_ids,
                 compat_order_ids=compat_order_ids,
                 rate=rate,
                 workers=workers,
@@ -82,9 +84,19 @@ def reconstruct_physical_schedule(
     pool_snapshot: dict,
     T: int,
     order_id_to_product: dict[str, str],
-) -> dict[str, list[tuple[int, str, str]]]:
+) -> dict[str, list[tuple[int, str, str, str]]]:
     """풀링된 집계 변수의 solved 값(pool_snapshot)을 실제 물리 라인
-    member_line_ids 각각의 (day, slot_label, activity) 시퀀스로 복원한다.
+    line_ids 각각의 (day, slot_label, activity, order_id) 시퀀스로
+    복원한다. order_id는 idle 슬롯에서는 빈 문자열이고, produce/setup
+    슬롯에서는 그 활동이 어느 주문(order_id) 때문인지를 담는다 - 여러
+    주문이 같은 product_id를 공유할 수 있어서(예: 아직 품번이 안 나온
+    "코드확인중" 같은 placeholder를 여러 실제 제품이 같이 쓰는 경우),
+    activity 문자열의 product_id만으로는 서로 다른 주문을 구분할 수
+    없다. CP-SAT 모델 자체는 처음부터 order_id 단위로 각 주문의 수량을
+    독립적으로 추적하므로(각 주문마다 별도의 produced_qty 제약) 실제
+    계획/배정은 항상 주문별로 정확하다 - order_id를 여기서 같이
+    돌려주는 건 순전히 "그 결과를 사람이 보는 CSV로 낼 때도 그 구분을
+    유지하기 위함"이다.
 
     pool_snapshot 형식: {
         "idle_fresh": {t: int}, "prod_fresh": {(t,oid): int},
@@ -112,7 +124,7 @@ def reconstruct_physical_schedule(
     공급으로 정확히 충당된다는 게 설계상 보장돼 있다 - 혹시라도 안 맞으면
     (버그면) 조용히 잘못된 스케줄을 내는 대신 즉시 RuntimeError를 낸다.
     """
-    labels = list(pool.member_line_ids)
+    labels = list(pool.line_ids)
 
     # 라벨(물리 라인)별로 재구성 과정에서 계속 갱신해나갈 "현재 상태" 3종.
     #   label_fresh[l]  : l이 "오늘(당일) 아직 아무 것도 안 한" 상태인지.
@@ -136,7 +148,7 @@ def reconstruct_physical_schedule(
     label_config: dict[str, str | None] = {l: None for l in labels}
     forced_next: dict[str, str] = {}  # label -> oid, 직전 슬롯에 그 제품으로 셋업해서 이번 슬롯엔 반드시 생산해야 함
 
-    entries: dict[str, list[tuple[int, str, str]]] = {l: [] for l in labels}
+    entries: dict[str, list[tuple[int, str, str, str]]] = {l: [] for l in labels}
 
     def take(pool_list: list[str], oid_pred, n: int, from_pool_desc: str, oid: str) -> list[str]:
         """pool_list(그 슬롯에서 아직 배정 안 된 라벨들의 리스트) 중
@@ -184,6 +196,7 @@ def reconstruct_physical_schedule(
         fresh_pool = [l for l in labels if label_fresh[l]]
         nonfresh_pool = [l for l in labels if not label_fresh[l]]
         assigned: dict[str, str] = {}  # 이번 슬롯에 각 라벨이 최종적으로 뭘 하는지 (아직 못 정한 라벨은 키가 없음)
+        assigned_order: dict[str, str] = {}  # 이번 슬롯에 각 라벨의 activity가 어느 주문 때문인지(idle이면 안 채워짐)
 
         # ------------------------------------------------------------------
         # 1단계: 직전 슬롯 셋업으로 생산이 예약된 라벨부터 강제 처리.
@@ -199,6 +212,7 @@ def reconstruct_physical_schedule(
                 raise RuntimeError(f"[pooling] 재구성 실패: 셋업 강제 생산 라벨 상태 불일치 (label={l}, oid={oid}, t={t})")
             nonfresh_pool.remove(l)
             assigned[l] = f"produce:{order_id_to_product[oid]}"
+            assigned_order[l] = oid
         # forced_this: 방금 소비한 예약 내역(2단계에서 prod_nf 수요 계산 시
         # "이미 처리된 몫"을 빼는 데 씀). forced_next 자체는 이번 슬롯에서
         # 새로 발생하는 셋업(3단계)을 위해 즉시 빈 딕셔너리로 재활용한다.
@@ -222,6 +236,7 @@ def reconstruct_physical_schedule(
                 chosen = take(nonfresh_pool, lambda l, oid=oid: label_config[l] == oid, need_prod, "non-fresh continuation(prod)", oid)
                 for l in chosen:
                     assigned[l] = f"produce:{order_id_to_product[oid]}"
+                    assigned_order[l] = oid
                 # label_config는 이미 oid이므로 그대로 유지(변경 불필요) -
                 # 계속 생산 중이라는 것 자체가 "여전히 oid로 설정돼 있다"는
                 # 뜻이라 별도 갱신이 필요 없다.
@@ -256,6 +271,7 @@ def reconstruct_physical_schedule(
                 chosen = take(nonfresh_pool, lambda l: True, need_setup, "non-fresh new setup", oid)
                 for l in chosen:
                     assigned[l] = f"setup:{order_id_to_product[oid]}"
+                    assigned_order[l] = oid
                     label_config[l] = oid
                     forced_next[l] = oid
 
@@ -279,6 +295,7 @@ def reconstruct_physical_schedule(
                 chosen = take(fresh_pool, lambda l: True, need, "fresh direct-produce", oid)
                 for l in chosen:
                     assigned[l] = f"produce:{order_id_to_product[oid]}"
+                    assigned_order[l] = oid
                     label_config[l] = oid
                     label_fresh[l] = False  # 이 슬롯부터 non-fresh로 전환(오늘 하루 동안 유지)
 
@@ -290,6 +307,6 @@ def reconstruct_physical_schedule(
 
         # 이번 슬롯의 최종 배정 결과를 각 라벨의 시퀀스에 기록.
         for l in labels:
-            entries[l].append((day, slot_label, assigned[l]))
+            entries[l].append((day, slot_label, assigned[l], assigned_order.get(l, "")))
 
     return entries
