@@ -25,11 +25,11 @@ def build_example_instance() -> tuple[list[Line], list[Order]]:
     (load_data_from_json 참고).
     """
     lines = [
-        Line(line_type_id="line_mask_1", category="mask", count=1),       # 로타리형: 속도 빠름, 인원 多
-        Line(line_type_id="line_mask_2", category="mask", count=1),       # 단발형: 속도 느림, 인원 少
-        Line(line_type_id="line_mask_3", category="mask", count=2),       # 셀라인형: 동일 설비 2대
-        Line(line_type_id="line_container_1", category="container", count=2),
-        Line(line_type_id="line_tube_1", category="tube", count=1),
+        Line(line_type_id="line_mask_1", count=1),       # 로타리형: 속도 빠름, 인원 多
+        Line(line_type_id="line_mask_2", count=1),       # 단발형: 속도 느림, 인원 少
+        Line(line_type_id="line_mask_3", count=2),       # 셀라인형: 동일 설비 2대
+        Line(line_type_id="line_container_1", count=2),
+        Line(line_type_id="line_tube_1", count=1),
     ]
 
     orders = [
@@ -86,7 +86,7 @@ def load_data_from_json(path: str) -> tuple[list[Line], list[Order]]:
 
     JSON 형식:
       {
-        "lines": [{"line_type_id": "...", "category": "mask", "count": 2}, ...],
+        "lines": [{"line_type_id": "...", "count": 2}, ...],
         "orders": [
           {"order_id": "...", "product_id": "...", "category": "mask",
            "quantity": 10000, "deadline_day": 12,

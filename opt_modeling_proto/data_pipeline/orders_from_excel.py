@@ -52,11 +52,13 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "category": ["제품군"],
     "product_id": ["품번"],
     "product_name": ["품명"],
+    "unit": ["단위"],
     "due_date": ["납기(인폼기준)"],
     "adjusted_due_date": ["조정납기일"],
     "order_qty": ["수주수량"],
     "produced_qty": ["생산완료"],
     "remaining_qty": ["생산잔량"],
+    "material_date": ["부자재"],
     "status": ["상태"],
 }
 
@@ -142,6 +144,40 @@ def _to_number(value) -> float | None:
     return None
 
 
+# "5매입", "(10매)", "10+1매/자급"처럼 품명에 붙는 매수 표기를 찾는다.
+# "+"로 여러 숫자가 이어진 경우(예: "10+1매") 그 합을 매수로 본다.
+_SHEET_COUNT_RE = re.compile(r"(\d+(?:\+\d+)*)\s*매")
+
+
+def _extract_sheet_count(product_name: str) -> int | None:
+    """품명에서 "(숫자)매" 패턴을 찾아 매수(시트 수)를 반환한다. 못
+    찾으면 None. 찾은 숫자(+가 있으면 합산한 값)가 1이면 "매수 표기가
+    실질적으로 없는 것"과 같으므로(예: "1매입"은 그냥 낱개 제품)
+    None을 반환해서 호출하는 쪽에서 별도 처리 없이 지나가게 한다."""
+    if not product_name:
+        return None
+    m = _SHEET_COUNT_RE.search(product_name)
+    if not m:
+        return None
+    total = sum(int(part) for part in m.group(1).split("+"))
+    return total if total != 1 else None
+
+
+def _resolve_material_date(value) -> date | None:
+    """'부자재' 열은 날짜(부자재 입고 예정일) 또는 "완료"/"확인중"/
+    "재고사용"/"5/12~5/20" 같은 자유 텍스트가 섞여 있다(실제 데이터
+    확인함). 텍스트는 날짜로 신뢰성 있게 해석할 방법이 없으므로(완료/
+    재고사용처럼 "이미 준비됨"을 뜻하는 경우도 있고, 애매한 부분 날짜
+    표기도 있음) 명확한 날짜 값(datetime/date)일 때만 해석하고, 그 외는
+    전부 "제약 없음"으로 취급한다 - 조용히 잘못 해석해서 불필요한
+    생산불가 제약을 거는 것보다 안전한 쪽을 택함."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return None
+
+
 def load_orders_from_excel(
     path: str,
     reference_date: date | None = None,
@@ -161,6 +197,22 @@ def load_orders_from_excel(
     이 주문을 만들 수 있고 속도/인원이 얼마인지는 별도 단계(각 기계가
     각 주문을 만들 때 rate/worker가 얼마인지 계산하는 스크립트)에서
     채워 넣는다.
+
+    category 보정 + 멀티시트 처리: '제품군'이 "파우치"면 "마스크"로
+    바꾼다. 그 결과 category가 "마스크"인 행은 '품명'에서 "(숫자)매"
+    표기(예: "5매입", "10+1매")를 찾아서(_extract_sheet_count 참고),
+    있으면 '단위'를 확인한다 - "SET"이면 생산잔량(개수 단위로 환산해야
+    스케줄러의 rate와 맞음)에 매수를 곱하고, "EA"면 생산잔량은 그대로
+    두되 category를 "마스크_멀티시트"로 바꿔서 별도 라인 스펙
+    (plan_from_orders.py의 CATEGORY_LINE_SPECS)이 적용되게 한다.
+
+    earliest_start_day: '부자재' 열에 실제 날짜 값이 있으면(텍스트는
+    "완료"/"확인중" 등 자유 서식이 섞여 있어 무시함, _resolve_material_date
+    참고) 그 날짜를 "이 주문의 생산이 가능해지는 첫날"로 계산해서 넣는다
+    (reference_date 당일이면 곧바로 1일차부터 가능하므로 제약 없음과
+    동일 - None으로 둠). 계획기간(horizon) 초과 여부는 이 함수가 horizon
+    길이를 모르므로 여기서는 확인하지 않고, 호출하는 쪽
+    (plan_from_orders.py의 filter_and_attach_rates)에서 처리한다.
     """
     reference_date = reference_date or date.today()
     # 시트가 "YYYY년MM월" 형식으로 매달 하나씩 쌓이는 구조인데, 과거 달
@@ -228,6 +280,28 @@ def load_orders_from_excel(
                 stats["excluded_deadline_passed"] += 1
                 continue
 
+            # ---- category 보정(파우치->마스크) + 멀티시트(매수) 처리 ----
+            category_raw = cell("category", r)
+            category = str(category_raw).strip() if category_raw is not None else ""
+            if category == "파우치":
+                category = "마스크"
+
+            sheet_multiplier = 1
+            if category == "마스크":
+                sheet_count = _extract_sheet_count(str(cell("product_name", r) or ""))
+                if sheet_count is not None:
+                    unit_raw = cell("unit", r)
+                    unit = str(unit_raw).strip().upper() if unit_raw is not None else ""
+                    if unit == "SET":
+                        sheet_multiplier = sheet_count
+                    elif unit == "EA":
+                        category = "마스크_멀티시트"
+                    else:
+                        warnings.append(
+                            f"{row_ref}: 품명에 '{sheet_count}매' 표기가 있으나 단위가 SET/EA가 "
+                            f"아님({unit!r}) - 매수 처리 생략"
+                        )
+
             # ---- 수량: 생산잔량(아직 안 만든 수량) 우선, 없으면 수주수량-생산완료로 계산 ----
             remaining_qty = _to_number(cell("remaining_qty", r))
             if remaining_qty is None:
@@ -242,6 +316,8 @@ def load_orders_from_excel(
             if remaining_qty is None or remaining_qty <= 0:
                 stats["excluded_nonpositive_qty"] += 1
                 continue
+            if sheet_multiplier != 1:
+                remaining_qty = remaining_qty * sheet_multiplier
 
             # ---- deadline_day 계산 ----
             deadline_day: int | None
@@ -250,16 +326,24 @@ def load_orders_from_excel(
             else:
                 deadline_day = (deadline.deadline_date - reference_date).days + 1
 
+            # ---- earliest_start_day 계산(부자재 입고일) ----
+            material_date = _resolve_material_date(cell("material_date", r))
+            earliest_start_day: int | None = None
+            if material_date is not None:
+                candidate = (material_date - reference_date).days + 1
+                if candidate > 1:  # 1일차(오늘)부터 가능하면 사실상 제약 없음과 동일
+                    earliest_start_day = candidate
+
             order_id = _make_order_id(cell("order_no", r), sheet_name, r, product_id, seen_order_ids)
-            category = cell("category", r)
 
             orders.append(
                 Order(
                     order_id=order_id,
                     product_id=product_id,
-                    category=str(category).strip() if category is not None else "",
+                    category=category,
                     quantity=int(round(remaining_qty)),
                     deadline_day=deadline_day,
+                    earliest_start_day=earliest_start_day,
                     rate={},
                     workers={},
                 )
@@ -308,8 +392,8 @@ def _make_order_id(
 
 def save_orders_json(orders: list[Order], path: str) -> None:
     """order 목록을 JSON 배열로 저장한다. 각 원소는 Order 필드 그대로
-    (order_id/product_id/category/quantity/deadline_day/backlog_cost_per_unit_per_day/
-    rate/workers) - scheduling.example_data.load_data_from_json이 기대하는
+    (order_id/product_id/category/quantity/deadline_day/earliest_start_day/
+    backlog_cost_per_unit_per_day/rate/workers) - scheduling.example_data.load_data_from_json이 기대하는
     최종 데이터는 {"lines": [...], "orders": [...]}인데, 이 스크립트는
     아직 lines(라인별 rate/workers)를 모르므로 orders 배열만 저장해둔다.
     다음 단계(rate/worker 계산 스크립트)에서 lines를 채워 최종 JSON으로
@@ -332,7 +416,7 @@ def save_orders_csv(orders: list[Order], path: str) -> None:
 
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["order_id", "product_id", "category", "quantity", "deadline_day"])
+        writer.writerow(["order_id", "product_id", "category", "quantity", "deadline_day", "earliest_start_day"])
         for o in orders:
             writer.writerow([
                 o.order_id,
@@ -340,6 +424,7 @@ def save_orders_csv(orders: list[Order], path: str) -> None:
                 o.category,
                 o.quantity,
                 "ASAP" if o.deadline_day is None else o.deadline_day,
+                "" if o.earliest_start_day is None else o.earliest_start_day,
             ])
 
 

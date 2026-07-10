@@ -50,10 +50,6 @@ class Line:
     """
 
     line_type_id: str
-    category: str  # "mask" / "container" / "tube" - 참고/표시용. 실제 생산
-                    # 가능 여부는 Order.rate에 그 라인이 등록되어 있고 값이
-                    # 0보다 큰지로 판단하므로, category가 달라도 rate만
-                    # 맞으면 모델상으로는 생산 가능하다.
     count: int = 1  # 이 타입의 물리 설비 대수. 1이면 그냥 라인 하나.
 
 
@@ -82,6 +78,13 @@ class Order:
     quantity: int                    # 필요 총 생산수량
     deadline_day: int | None = None  # 1-indexed. 이 날짜의 마지막 슬롯(18-19시)까지 완료되어야 함.
                                       # None이면 ASAP(마감 없음) - 아래 backlog_cost_per_unit_per_day 참고.
+    earliest_start_day: int | None = None
+        # 1-indexed. 부자재(포장재 등) 입고일처럼 "이 날짜 전에는 아예
+        # 생산 자체가 불가능한" 제약이 있을 때 쓴다. 이 날짜의 첫
+        # 슬롯(08-09시)부터 생산/셋업이 가능해진다 - 그 전 슬롯들은
+        # solver.py에서 deadline_day 이후를 막는 것과 대칭으로 해당
+        # 주문의 생산/셋업을 전부 0으로 강제한다. None이면 제약
+        # 없음(1일차부터 바로 생산 가능, 지금까지의 기본 동작과 동일).
     backlog_cost_per_unit_per_day: float | None = None
         # ASAP 주문(deadline_day=None)에서만 쓰인다. 하루 지날 때마다 아직
         # 못 만든 수량 1개당 이 비용이 목적함수에 더해진다. None이면

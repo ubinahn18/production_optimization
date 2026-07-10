@@ -51,6 +51,14 @@ CATEGORY_LINE_SPECS: dict[str, list[dict]] = {
         {"line_type_id": "로타리", "count": 2, "workers": 7, "rate": 3000},
         {"line_type_id": "10열기", "count": 6, "workers": 11, "rate": 8750},
     ],
+    # 품명에 매수 표기(예: "10매")가 있고 단위가 "EA"인 마스크 주문 -
+    # 데이터 로딩 단계(data_pipeline/orders_from_excel.py)에서 "마스크"
+    # 대신 이 category로 분류된다. 로타리에서만 생산 가능 - 물리적으로는
+    # 위 "마스크"의 로타리와 같은 설비다(build_lines()가 line_type_id
+    # 기준으로 중복 제거하므로 물리 라인이 따로 늘어나지는 않음).
+    "마스크_멀티시트": [
+        {"line_type_id": "로타리", "count": 2, "workers": 7, "rate": 3000},
+    ],
     "튜브": [
         {"line_type_id": "튜브라인", "count": 3, "workers": 10, "rate": 2100},
     ],
@@ -60,15 +68,33 @@ MAX_DEADLINE_DAY = 30
 
 
 def build_lines() -> list[Line]:
-    """CATEGORY_LINE_SPECS에 정의된 라인 타입들을 그대로 Line 목록으로
-    만든다. 카테고리 간에 라인 타입이 겹치지 않으므로(셀라인/단발은
-    용기 전용, 로타리/10열기는 마스크 전용, 튜브라인은 튜브 전용)
-    line_type_id 충돌 걱정은 없다."""
-    lines = []
+    """CATEGORY_LINE_SPECS에 정의된 라인 타입들을 Line 목록으로 만든다.
+
+    대부분의 라인 타입은 카테고리 하나에만 등장하지만(셀라인/단발은
+    용기 전용, 10열기는 마스크 전용, 튜브라인은 튜브 전용), "로타리"는
+    "마스크"와 "마스크_멀티시트" 둘 다에 나온다 - 물리적으로 동일한
+    설비가 주문에 따라 두 category 중 하나로 취급될 뿐이라서다. 그래서
+    같은 line_type_id가 여러 category spec에 등장하면 Line은 딱 하나만
+    만들고(Line 자체는 category를 갖지 않음 - 생산 가능 여부는 항상
+    Order.rate로 판단하므로 어느 category에 등장했는지는 무관함,
+    scheduling/models.py의 Line 참고), count가 서로 다르면 물리 대수가
+    모호해지므로 에러를 낸다."""
+    lines_by_type: dict[str, Line] = {}
+    first_category_by_type: dict[str, str] = {}  # 에러 메시지에서 어느 category끼리 충돌했는지 보여주기 위한 용도
     for category, specs in CATEGORY_LINE_SPECS.items():
         for spec in specs:
-            lines.append(Line(line_type_id=spec["line_type_id"], category=category, count=spec["count"]))
-    return lines
+            type_id = spec["line_type_id"]
+            existing = lines_by_type.get(type_id)
+            if existing is not None:
+                if existing.count != spec["count"]:
+                    raise ValueError(
+                        f"라인 타입 {type_id!r}이 서로 다른 count로 중복 정의됨: "
+                        f"{first_category_by_type[type_id]}={existing.count} vs {category}={spec['count']}"
+                    )
+                continue
+            lines_by_type[type_id] = Line(line_type_id=type_id, count=spec["count"])
+            first_category_by_type[type_id] = category
+    return list(lines_by_type.values())
 
 
 # 지금은 그냥 line_type_id 가 rate와 workers를 결정하도록 했으니까 모든 order에 대해서 category만 읽으면 자동으로 
@@ -79,7 +105,13 @@ def filter_and_attach_rates(orders: list[Order]) -> tuple[list[Order], dict[str,
     아닌 벌크/파우치/샤쉐 등)과 납기가 MAX_DEADLINE_DAY를 넘는 주문을
     걸러내고, 남은 주문에는 그 제품군의 rate/workers를 채워 넣는다
     (orders_from_excel.py가 만드는 Order는 rate/workers가 항상 빈
-    dict라서 여기서 처음 채워짐)."""
+    dict라서 여기서 처음 채워짐).
+
+    earliest_start_day(부자재 입고일 등으로 정해지는 최초 생산가능일)가
+    계획기간(MAX_DEADLINE_DAY)을 넘는 값이면 여기서 지워서(None) 제약을
+    걸지 않는다 - orders_from_excel.py는 계획기간 길이를 모르므로 값을
+    그대로(우리 horizon 밖일 수도 있는 채로) 넘겨주고, 실제 horizon
+    길이를 아는 이 함수에서 최종 판단한다."""
     kept: list[Order] = []
     stats = {"total": len(orders), "excluded_category": 0, "excluded_deadline": 0, "included": 0}
     for o in orders:
@@ -90,6 +122,8 @@ def filter_and_attach_rates(orders: list[Order]) -> tuple[list[Order], dict[str,
         if o.deadline_day is not None and o.deadline_day > MAX_DEADLINE_DAY:
             stats["excluded_deadline"] += 1
             continue
+        if o.earliest_start_day is not None and o.earliest_start_day > MAX_DEADLINE_DAY:
+            o.earliest_start_day = None
         o.rate = {s["line_type_id"]: s["rate"] for s in specs}
         o.workers = {s["line_type_id"]: s["workers"] for s in specs}
         kept.append(o)
@@ -102,7 +136,7 @@ def main():
     parser.add_argument("--excel-path", default=DEFAULT_EXCEL_PATH, help="수주진행현황 엑셀 경로")
     parser.add_argument("--reference-date", default=None, help="기준일(YYYY-MM-DD, 생략하면 오늘)")
     parser.add_argument("--horizon-days", type=int, default=MAX_DEADLINE_DAY)
-    parser.add_argument("--daily-wage", type=float, default=200_000, help="1인 1일 고용 정액임금")
+    parser.add_argument("--daily-wage", type=float, default=120_000, help="1인 1일 고용 정액임금")
     parser.add_argument("--hourly-wage", type=float, default=None, help="잔업수당 계산용 시급 (미지정시 daily-wage/8)")
     parser.add_argument("--overtime-multiplier", type=float, default=1.5)
     parser.add_argument(

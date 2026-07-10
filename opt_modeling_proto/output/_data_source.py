@@ -90,19 +90,23 @@ def build_rate_lookup(lines, orders) -> dict[tuple[str, str], float]:
     return _build_field_lookup(lines, orders, "rate")
 
 
-def build_line_category_lookup(lines, orders) -> dict[str, str]:
-    """{물리 line_id: 그 라인의 category}.
+def build_order_category_lookup(orders) -> dict[str, str]:
+    """{order_id: 그 주문의 category}.
 
-    product_id 기준이 아니라 라인 기준으로 category를 매기는 이유:
-    "코드확인중"/"코드생성전" 같은 플레이스홀더 product_id는 서로 다른
-    제품군의 여러 실제 제품이 같은 문자열을 공유해서, product_id ->
-    category 매핑 자체가 애매하다(실제로 이 문제로 잘못된 결과가 나온
-    적 있음). 반면 라인은 plan_from_orders.py의 CATEGORY_LINE_SPECS
-    설계상 카테고리 전용이라(예: 튜브라인은 물리적으로 튜브만 생산),
-    라인 기준 매핑은 항상 명확하다.
+    product_id 기준으로 category를 매기면 안 되는 이유: "코드확인중"/
+    "코드생성전" 같은 플레이스홀더 product_id는 서로 다른 제품군의 여러
+    실제 제품이 같은 문자열을 공유해서, product_id -> category 매핑
+    자체가 애매하다(실제로 이 문제로 잘못된 결과가 나온 적 있음).
+
+    예전엔 물리 line_id 기준으로 매겼었다(라인은 카테고리 전용이라
+    명확하다는 가정) - 하지만 plan_from_orders.py의 CATEGORY_LINE_SPECS에
+    "마스크_멀티시트"가 추가되면서 "로타리" 물리 라인 하나가 "마스크"와
+    "마스크_멀티시트" 두 category의 주문을 둘 다 생산할 수 있게 됐다.
+    즉 "라인은 카테고리 전용"이라는 전제 자체가 깨졌으므로(build_lines()가
+    로타리에 표시용 category를 "마스크" 하나로 고정해버리면, 실제로는
+    로타리에서 만든 "마스크_멀티시트" 생산량까지 전부 "마스크"로 잘못
+    집계된다), line_id 기준 매핑은 더 이상 안전하지 않다. order_id는
+    애초에 유일하고 category도 주문마다 명확히 정해져 있으므로(라인이
+    몇 종류의 category를 겸하든 상관없이) 이 문제 자체가 생기지 않는다.
     """
-    lookup: dict[str, str] = {}
-    for line, pool in zip(lines, build_line_pools(lines, orders)):
-        for line_id in pool.line_ids:
-            lookup[line_id] = line.category
-    return lookup
+    return {o.order_id: o.category for o in orders}

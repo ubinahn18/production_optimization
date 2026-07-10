@@ -56,6 +56,8 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
     for o in orders:
         if o.deadline_day is not None and not (1 <= o.deadline_day <= horizon_days):
             raise ValueError(f"주문 {o.order_id}의 마감일({o.deadline_day})이 계획기간(1~{horizon_days})을 벗어났습니다.")
+        if o.earliest_start_day is not None and not (1 <= o.earliest_start_day <= horizon_days):
+            raise ValueError(f"주문 {o.order_id}의 최초생산가능일({o.earliest_start_day})이 계획기간(1~{horizon_days})을 벗어났습니다.")
 
     model = cp_model.CpModel()
 
@@ -133,6 +135,15 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
         )
         for o in orders
     }
+    # earliest_start_day가 있으면(예: 부자재 입고일) 그 날짜 첫 슬롯
+    # 전까지는 그 주문의 생산/셋업을 전부 막는다 - deadline_slot_by_order와
+    # 대칭인 하한 버전. None이면 0(=처음부터 제약 없음).
+    earliest_start_slot_by_order = {
+        o.order_id: (
+            (o.earliest_start_day - 1) * SLOTS_PER_DAY if o.earliest_start_day is not None else 0
+        )
+        for o in orders
+    }
 
     for p in pools:
         pkey = tuple(p.line_ids)
@@ -206,6 +217,10 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
                 if local == SLOTS_PER_DAY - 1:
                     model.Add(su == 0)
                 if t > deadline_slot_by_order[oid]:
+                    model.Add(su == 0)
+                    model.Add(pf == 0)
+                    model.Add(pnf == 0)
+                if t < earliest_start_slot_by_order[oid]:
                     model.Add(su == 0)
                     model.Add(pf == 0)
                     model.Add(pnf == 0)
