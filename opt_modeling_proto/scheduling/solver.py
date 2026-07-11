@@ -58,6 +58,8 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
             raise ValueError(f"주문 {o.order_id}의 마감일({o.deadline_day})이 계획기간(1~{horizon_days})을 벗어났습니다.")
         if o.earliest_start_day is not None and not (1 <= o.earliest_start_day <= horizon_days):
             raise ValueError(f"주문 {o.order_id}의 최초생산가능일({o.earliest_start_day})이 계획기간(1~{horizon_days})을 벗어났습니다.")
+    if any(not (1 <= d <= horizon_days) for d in config.closed_days):
+        raise ValueError(f"closed_days에 계획기간(1~{horizon_days}) 밖의 날짜가 있습니다: {sorted(config.closed_days)}")
 
     model = cp_model.CpModel()
 
@@ -150,6 +152,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
         k = p.k
         for t in range(T):
             local = t % SLOTS_PER_DAY
+            day_of_t = t // SLOTS_PER_DAY + 1  # 1-based, deadline_day와 동일한 축
 
             fv = model.NewIntVar(0, k, f"idleFresh[{pkey[0]},{t}]")
             idle_fresh[pkey, t] = fv
@@ -221,6 +224,10 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
                     model.Add(pf == 0)
                     model.Add(pnf == 0)
                 if t < earliest_start_slot_by_order[oid]:
+                    model.Add(su == 0)
+                    model.Add(pf == 0)
+                    model.Add(pnf == 0)
+                if day_of_t in config.closed_days:
                     model.Add(su == 0)
                     model.Add(pf == 0)
                     model.Add(pnf == 0)

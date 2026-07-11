@@ -50,6 +50,7 @@ DATA_START_ROW = 3
 COLUMN_ALIASES: dict[str, list[str]] = {
     "order_no": ["수주번호"],
     "category": ["제품군"],
+    "vendor": ["발주처"],
     "product_id": ["품번"],
     "product_name": ["품명"],
     "unit": ["단위"],
@@ -58,7 +59,8 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "order_qty": ["수주수량"],
     "produced_qty": ["생산완료"],
     "remaining_qty": ["생산잔량"],
-    "material_date": ["부자재"],
+    "submaterial_date": ["부자재입고예정일"],
+    "raw_material_date": ["원료입고예정일"],
     "status": ["상태"],
 }
 
@@ -163,14 +165,15 @@ def _extract_sheet_count(product_name: str) -> int | None:
     return total if total != 1 else None
 
 
-def _resolve_material_date(value) -> date | None:
-    """'부자재' 열은 날짜(부자재 입고 예정일) 또는 "완료"/"확인중"/
-    "재고사용"/"5/12~5/20" 같은 자유 텍스트가 섞여 있다(실제 데이터
-    확인함). 텍스트는 날짜로 신뢰성 있게 해석할 방법이 없으므로(완료/
-    재고사용처럼 "이미 준비됨"을 뜻하는 경우도 있고, 애매한 부분 날짜
-    표기도 있음) 명확한 날짜 값(datetime/date)일 때만 해석하고, 그 외는
-    전부 "제약 없음"으로 취급한다 - 조용히 잘못 해석해서 불필요한
-    생산불가 제약을 거는 것보다 안전한 쪽을 택함."""
+def _resolve_supply_date(value) -> date | None:
+    """'부자재입고예정일'/'원료입고예정일' 열은 날짜값이 기본이지만,
+    예전 '부자재' 통합 열처럼 "완료"/"확인중"/"재고사용"/"5/12~5/20"
+    같은 자유 텍스트가 섞여 들어올 가능성을 배제할 수 없다. 텍스트는
+    날짜로 신뢰성 있게 해석할 방법이 없으므로(완료/재고사용처럼 "이미
+    준비됨"을 뜻하는 경우도 있고, 애매한 부분 날짜 표기도 있음) 명확한
+    날짜 값(datetime/date)일 때만 해석하고, 그 외는 전부 "제약 없음"으로
+    취급한다 - 조용히 잘못 해석해서 불필요한 생산불가 제약을 거는 것보다
+    안전한 쪽을 택함."""
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
@@ -206,13 +209,15 @@ def load_orders_from_excel(
     두되 category를 "마스크_멀티시트"로 바꿔서 별도 라인 스펙
     (plan_from_orders.py의 CATEGORY_LINE_SPECS)이 적용되게 한다.
 
-    earliest_start_day: '부자재' 열에 실제 날짜 값이 있으면(텍스트는
-    "완료"/"확인중" 등 자유 서식이 섞여 있어 무시함, _resolve_material_date
-    참고) 그 날짜를 "이 주문의 생산이 가능해지는 첫날"로 계산해서 넣는다
-    (reference_date 당일이면 곧바로 1일차부터 가능하므로 제약 없음과
-    동일 - None으로 둠). 계획기간(horizon) 초과 여부는 이 함수가 horizon
-    길이를 모르므로 여기서는 확인하지 않고, 호출하는 쪽
-    (plan_from_orders.py의 filter_and_attach_rates)에서 처리한다.
+    earliest_start_day: '부자재입고예정일'/'원료입고예정일' 두 열 중 실제
+    날짜 값이 있는 쪽을 각각 해석하고(텍스트는 자유 서식이 섞여 있어
+    무시함, _resolve_supply_date 참고), 생산은 포장재(부자재)와 원료가
+    둘 다 들어와야 시작할 수 있으므로 두 날짜 중 더 늦은 날짜를 "이
+    주문의 생산이 가능해지는 첫날"로 계산해서 넣는다(reference_date
+    당일이면 곧바로 1일차부터 가능하므로 제약 없음과 동일 - None으로
+    둠). 계획기간(horizon) 초과 여부는 이 함수가 horizon 길이를 모르므로
+    여기서는 확인하지 않고, 호출하는 쪽(plan_from_orders.py의
+    filter_and_attach_rates)에서 처리한다.
     """
     reference_date = reference_date or date.today()
     # 시트가 "YYYY년MM월" 형식으로 매달 하나씩 쌓이는 구조인데, 과거 달
@@ -326,15 +331,28 @@ def load_orders_from_excel(
             else:
                 deadline_day = (deadline.deadline_date - reference_date).days + 1
 
-            # ---- earliest_start_day 계산(부자재 입고일) ----
-            material_date = _resolve_material_date(cell("material_date", r))
+            # ---- earliest_start_day 계산(부자재/원료 입고일 중 더 늦은 날짜) ----
+            # 생산은 포장재(부자재)와 원료가 둘 다 도착해야 시작할 수 있으므로,
+            # 두 열 각각 해석한 뒤 더 늦은 날짜를 기준으로 삼는다.
+            supply_dates = [
+                d
+                for d in (
+                    _resolve_supply_date(cell("submaterial_date", r)),
+                    _resolve_supply_date(cell("raw_material_date", r)),
+                )
+                if d is not None
+            ]
             earliest_start_day: int | None = None
-            if material_date is not None:
-                candidate = (material_date - reference_date).days + 1
+            if supply_dates:
+                latest_supply_date = max(supply_dates)
+                candidate = (latest_supply_date - reference_date).days + 1
                 if candidate > 1:  # 1일차(오늘)부터 가능하면 사실상 제약 없음과 동일
                     earliest_start_day = candidate
 
             order_id = _make_order_id(cell("order_no", r), sheet_name, r, product_id, seen_order_ids)
+
+            vendor_raw = cell("vendor", r)
+            product_name_raw = cell("product_name", r)
 
             orders.append(
                 Order(
@@ -342,6 +360,8 @@ def load_orders_from_excel(
                     product_id=product_id,
                     category=category,
                     quantity=int(round(remaining_qty)),
+                    product_name=str(product_name_raw).strip() if product_name_raw is not None else "",
+                    vendor=str(vendor_raw).strip() if vendor_raw is not None else "",
                     deadline_day=deadline_day,
                     earliest_start_day=earliest_start_day,
                     rate={},

@@ -76,6 +76,9 @@ class Order:
     product_id: str
     category: str
     quantity: int                    # 필요 총 생산수량
+    product_name: str = ""  # 원본 품명. 특정 발주처+품명 조합에 예외 라인을
+                             # 배정하는 등 category만으로는 구분 안 되는 케이스에 사용(예: plan_from_orders.py의 셀바이오 예외).
+    vendor: str = ""         # 발주처(원본 '발주처' 열). 위 product_name과 같은 용도.
     deadline_day: int | None = None  # 1-indexed. 이 날짜의 마지막 슬롯(18-19시)까지 완료되어야 함.
                                       # None이면 ASAP(마감 없음) - 아래 backlog_cost_per_unit_per_day 참고.
     earliest_start_day: int | None = None
@@ -156,6 +159,12 @@ class ScheduleConfig:
     # 된다 - --backlog-cost CLI 옵션이나 Order.backlog_cost_per_unit_per_day로
     # 전역/주문별로 둘 다 조정 가능.
     default_backlog_cost_per_unit_per_day: float = 20.0
+
+    # 생산/셋업이 금지되는 날(day index, 1-based, deadline_day와 동일한
+    # 축 - reference_date를 1일차로 함). 주말/공휴일 등. solver는 날짜를
+    # 전혀 모르고 이 숫자 집합만 본다 - 실제 (기준일 + 휴무일 목록) ->
+    # day index 변환은 plan_from_orders.py의 resolve_closed_days()가 담당.
+    closed_days: frozenset[int] = field(default_factory=frozenset)
 
     def resolved_hourly_wage(self) -> float:
         return self.hourly_wage if self.hourly_wage is not None else self.daily_wage / 8.0
