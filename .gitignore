@@ -5,3 +5,5 @@ __pycache__/
 **/output/*.json
 **/output/real_plan/*.csv
 **/output/real_plan/*.png
+**/output/real_plan/**/*.csv
+**/output/real_plan/**/*.png
