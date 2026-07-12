@@ -25,7 +25,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-DEFAULT_EXCEL = r"C:\Users\ubina\Downloads\수주진행현황(simulation_DATA_1)1.xlsx"
+DEFAULT_EXCEL = r"C:\Users\USER\production_opt\수주진행현황(simulation_DATA_2).xlsx"
 DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 SHEET_NAME = "2026년07월"
 

@@ -21,7 +21,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-DEFAULT_EXCEL = r"C:\Users\ubina\Downloads\수주진행현황(simulation_DATA_1)1.xlsx"
+DEFAULT_EXCEL = r"C:\Users\USER\production_opt\수주진행현황(simulation_DATA_2).xlsx"
 SHEET_NAME = "2026년07월"
 
 DUE_COL = "납기\n(인폼 기준)"
