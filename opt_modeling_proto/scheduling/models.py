@@ -160,6 +160,21 @@ class ScheduleConfig:
     # 전역/주문별로 둘 다 조정 가능.
     default_backlog_cost_per_unit_per_day: float = 20.0
 
+    # 제품군(Order.category)별 재고 보관비용(원/개/일). 마감일이 있는
+    # 주문에서 실제로 그 슬롯에 생산된 수량은 (마감일 - 그 슬롯이 속한
+    # 날짜)일만큼 미리 만들어져 재고로 쌓여있다가 마감일에 쓰인다고 보고,
+    # "생산량 x 그 날수"에 이 비용을 곱해 목적함수에 더한다(너무 일찍
+    # 만들어서 오래 쌓아두는 걸 억제하는 효과). 이 dict에 없는 category는
+    # default_storage_cost_per_unit_per_day를 대신 쓴다. ASAP
+    # 주문(deadline_day=None)은 "마감일까지 며칠 이른지" 자체를 정의할 수
+    # 없어서 애초에 대상에서 제외한다(늦어지는 쪽 페널티는
+    # backlog_cost_per_unit_per_day로 이미 별도 처리됨).
+    storage_cost_by_category: dict[str, float] = field(default_factory=dict)
+    # storage_cost_by_category에 없는 category에 적용할 기본 보관비용.
+    # 기본값 0.0 = 아무것도 설정하지 않으면 이 목적함수 항이 항상 0이라
+    # 기존 동작과 100% 동일하게 유지된다.
+    default_storage_cost_per_unit_per_day: float = 0.0
+
     # 생산/셋업이 금지되는 날(day index, 1-based, deadline_day와 동일한
     # 축 - reference_date를 1일차로 함). 주말/공휴일 등. solver는 날짜를
     # 전혀 모르고 이 숫자 집합만 본다 - 실제 (기준일 + 휴무일 목록) ->
@@ -177,7 +192,7 @@ class ScheduleConfig:
 class ScheduleResult:
     status_name: str
     is_feasible: bool
-    total_cost: float | None         # labor_cost + backlog_cost. 1단계 목적함수 값과 동일(비교/최적화 기준용).
+    total_cost: float | None         # labor_cost + backlog_cost + storage_cost. 1단계 목적함수 값과 동일(비교/최적화 기준용).
     daily_workforce: dict            # {day(1-idx): 그날 고용 인원수}
     overtime_workers: dict           # {day(1-idx): {"17-18": 인원, "18-19": 인원}}
     line_activity: dict              # {line_id: [(day, slot_label, activity, order_id) ...]} (activity: "idle" / "setup:<product_id>" / "produce:<product_id>"; order_id는 idle이면 "", 아니면 그 activity를 발생시킨 주문. 여러 주문이 같은 product_id를 공유할 수 있어서(예: "코드확인중" 같은 placeholder) product_id만으로는 주문을 구분 못 할 수 있음 - order_id로 구분)
@@ -185,3 +200,4 @@ class ScheduleResult:
     continuity_score: int | None = None  # 2단계 목적함수 값(대기<->생산 전환횟수 + 셋업횟수). 작을수록 라인이 안 끊기고 오래 이어짐.
     labor_cost: float | None = None      # 실제로 지급되는 돈: 일일 정액임금 합 + 잔업수당 합 (backlog 비용 제외).
     backlog_cost: float | None = None    # ASAP 주문 backlog 페널티 합 - 실제 지급되는 돈이 아니라 "늦게 끝낼수록 손해"를 모델링하기 위한 가상 비용.
+    storage_cost: float | None = None    # 마감일 있는 주문의 재고 보관비용 합(storage_cost_by_category 참고) - 실제 지출이 아니라 "너무 일찍 만들어 오래 쌓아두는 것"을 억제하기 위한 가상 비용.

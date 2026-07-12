@@ -33,15 +33,15 @@ from datetime import date, timedelta
 
 # Windows 콘솔(cp949 등) 기본 인코딩에서는 한글 출력이 깨지므로 UTF-8로 강제.
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 
 from data_pipeline.orders_from_excel import load_orders_from_excel
 from scheduling.models import Line, Order, ScheduleConfig
 from scheduling.report import plot_gantt, print_report, save_outputs
 from scheduling.solver import build_and_solve
 
-DEFAULT_EXCEL_PATH = r"C:\Users\ubina\Downloads\수주진행현황(simulation_DATA_1)1.xlsx"
+DEFAULT_EXCEL_PATH = r"C:\Users\USER\production_opt\수주진행현황(simulation_DATA_2).xlsx"
 
 # 제품군(category)별로 사용 가능한 라인 타입 + 그 라인에서 이 제품군을
 # 생산할 때 필요한 인원(workers)/시간당 생산량(rate). "같은 제품군이면
@@ -77,6 +77,29 @@ CATEGORY_LINE_SPECS: dict[str, list[dict]] = {
     "셀바이오_사각패드": [
         {"line_type_id": "셀바이오_라인", "count": 1, "workers": 12, "rate": 750},
     ],
+}
+
+# 제품군(category)별 재고 보관비용(원/개/일) - scheduling.models.ScheduleConfig.
+# storage_cost_by_category에 그대로 전달됨. 마감일 있는 주문이 실제
+# 마감일보다 며칠 일찍 만들어지면, 그 수량 x 앞당긴 일수만큼 이 비용이
+# 목적함수에 더해져서 너무 일찍 만들어 오래 쌓아두는 걸 억제한다(자세한
+# 계산 방식은 scheduling/solver.py의 storage_terms 관련 주석 참고).
+#
+# 키는 CATEGORY_LINE_SPECS의 키가 아니라 실제 Order.category 값 기준이다
+# - "셀바이오_사각패드"는 build_lines()가 물리 라인을 만들 때만 쓰는
+# 키일 뿐, filter_and_attach_rates()가 o.category 자체는 안 바꾸므로
+# (엑셀 원본 그대로 "용기"로 남음) 여기 넣어도 매칭이 안 된다. 그래서
+# 여기엔 "용기"/"마스크"/"마스크_멀티시트"/"튜브"만 올린다(셀바이오
+# 주문도 "용기" 값을 그대로 적용받음 - production_efficiency.py의
+# 카테고리 집계와 동일한 방식).
+#
+# 여기 없는 category는 0(보관비용 없음)으로 취급된다. ASAP 주문(납기
+# 없음)은 category와 무관하게 애초에 대상에서 제외됨.
+CATEGORY_STORAGE_COST: dict[str, float] = {
+    "용기": 10,
+    "마스크": 1,
+    "마스크_멀티시트": 1,
+    "튜브": 4,
 }
 
 # "셀바이오_사각패드" 예외 대상 판별 기준(발주처+품명 부분일치).
@@ -287,6 +310,7 @@ def main():
         secondary_time_limit_seconds=args.secondary_time_limit,
         optimize_continuity=not args.no_continuity,
         default_backlog_cost_per_unit_per_day=args.backlog_cost,
+        storage_cost_by_category=CATEGORY_STORAGE_COST,
         closed_days=closed_days,
     )
     print(

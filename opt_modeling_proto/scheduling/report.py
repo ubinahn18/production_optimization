@@ -45,7 +45,10 @@ def print_report(result: ScheduleResult, orders: list[Order]):
         print("[결과] 실행 가능한 스케줄을 찾지 못했습니다. 마감일/라인수/인원 데이터를 확인하세요.")
         return
 
-    print(f"[결과] 총 비용: {result.total_cost:,.0f}  (실 인건비 {result.labor_cost:,.0f} + ASAP backlog 페널티 {result.backlog_cost:,.0f})")
+    print(
+        f"[결과] 총 비용: {result.total_cost:,.0f}  (실 인건비 {result.labor_cost:,.0f} + "
+        f"ASAP backlog 페널티 {result.backlog_cost:,.0f} + 재고 보관비용 {result.storage_cost:,.0f})"
+    )
     if result.continuity_score is not None:
         print(f"[결과] 연속성 점수(대기<->생산 전환 + 셋업 횟수, 작을수록 좋음): {result.continuity_score}")
 

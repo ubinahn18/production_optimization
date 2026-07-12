@@ -257,6 +257,14 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
     #   다룬다(docstring 및 Order.deadline_day 참고).
     # ------------------------------------------------------------------
     produced_qty: dict[str, cp_model.IntVar] = {}
+    # 마감일 있는 주문의 "너무 일찍 만들어서 오래 쌓아두는" 재고 보관비용
+    # 집계용. 슬롯 t에 생산된 수량은 (마감일 - t가 속한 날짜)일만큼 미리
+    # 만들어져 쌓여있다고 보고, 그 "수량 x 날수"를 오더별로 storage_weighted_var에
+    # 모아둔다. ASAP 주문(deadline_day=None)은 "마감일까지 며칠 이른지"
+    # 자체가 정의되지 않으므로 대상에서 제외한다(늦어지는 쪽은 이미
+    # backlog_cost_terms로 별도 처리됨).
+    storage_weighted_var: dict[str, cp_model.IntVar] = {}
+    storage_rate_by_order: dict[str, float] = {}  # oid -> 개당/일당 보관비용, 리포트용 총비용 재계산에 사용
     for o in orders:
         oid = o.order_id
         compat = o.compatible_line_types()
@@ -269,20 +277,40 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
         max_rate_sum = sum(int(round(o.rate[lid])) for lid in compat)
         upper_bound = max_rate_sum * eligible_slots + 1  # 이론상 최대 생산량(모든 호환라인이 마감일까지 이 제품만 생산) + 여유 1
 
+        storage_rate = None
+        if not o.is_asap():
+            storage_rate = config.storage_cost_by_category.get(
+                o.category, config.default_storage_cost_per_unit_per_day
+            )
+
         terms = []
+        storage_terms = []
         for p in compat_pools_for(compat):
             pkey = tuple(p.line_ids)
             rate_val = int(round(p.rate[oid]))
             if rate_val <= 0:
                 continue
             for t in range(eligible_slots):
-                terms.append((rate_val, prod_fresh[pkey, t, oid] + prod_nf[pkey, t, oid]))
+                prod_var = prod_fresh[pkey, t, oid] + prod_nf[pkey, t, oid]
+                terms.append((rate_val, prod_var))
+                if storage_rate:  # 0/None이면 목적함수에 기여가 없으니 변수/제약을 아예 안 만들어 모델 크기를 아낀다
+                    day_of_t = t // SLOTS_PER_DAY + 1
+                    days_held = o.deadline_day - day_of_t  # eligible_slots 범위 안에서는 항상 >= 0
+                    if days_held > 0:
+                        storage_terms.append((days_held * rate_val, prod_var))
 
         pv = model.NewIntVar(0, max(upper_bound, o.quantity), f"produced[{oid}]")
         model.Add(pv == sum(coef * var for coef, var in terms))
         if not o.is_asap():
             model.Add(pv >= o.quantity)  # 마감일 전까지 필요수량 이상 생산(시간 슬롯 단위라 약간의 초과생산은 허용)
         produced_qty[oid] = pv
+
+        if storage_terms:
+            storage_upper = max_rate_sum * eligible_slots * horizon_days + 1
+            sv = model.NewIntVar(0, storage_upper, f"storageWeighted[{oid}]")
+            model.Add(sv == sum(coef * var for coef, var in storage_terms))
+            storage_weighted_var[oid] = sv
+            storage_rate_by_order[oid] = storage_rate
 
     # ------------------------------------------------------------------
     # ASAP 주문의 backlog(진도 지연) 비용 집계.
@@ -421,6 +449,8 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
             objective_terms.append(total_workers_var[d * SLOTS_PER_DAY + s] * ot_hour_wage_scaled)
     for bl, rate_per_day in backlog_cost_terms:
         objective_terms.append(bl * int(round(rate_per_day * MONEY_SCALE)))
+    for oid, sv in storage_weighted_var.items():
+        objective_terms.append(sv * int(round(storage_rate_by_order[oid] * MONEY_SCALE)))
     model.Minimize(sum(objective_terms))
 
     def snapshot(solver: cp_model.CpSolver) -> dict:
@@ -442,6 +472,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
             "total_workers": {t: solver.Value(v) for t, v in total_workers_var.items()},
             "daily_workforce": {d: solver.Value(v) for d, v in daily_workforce_var.items()},
             "backlog_by_order_day": {k: solver.Value(v) for k, v in backlog_by_order_day.items()},
+            "storage_weighted": {k: solver.Value(v) for k, v in storage_weighted_var.items()},
             "idle_fresh": {k: solver.Value(v) for k, v in idle_fresh.items()},
             "prod_fresh": {k: solver.Value(v) for k, v in prod_fresh.items()},
             "idle_nf_of": {k: solver.Value(v) for k, v in idle_nf_of.items()},
@@ -586,9 +617,14 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
         bl_val * int(round(backlog_rate_by_order[oid] * MONEY_SCALE))
         for (oid, d), bl_val in best_snapshot["backlog_by_order_day"].items()
     )
+    storage_cost_scaled = sum(
+        sw_val * int(round(storage_rate_by_order[oid] * MONEY_SCALE))
+        for oid, sw_val in best_snapshot["storage_weighted"].items()
+    )
     labor_cost = labor_cost_scaled / MONEY_SCALE
     backlog_cost = backlog_cost_scaled / MONEY_SCALE
-    total_cost = labor_cost + backlog_cost
+    storage_cost = storage_cost_scaled / MONEY_SCALE
+    total_cost = labor_cost + backlog_cost + storage_cost
 
     daily_workforce = {d + 1: best_snapshot["daily_workforce"][d] for d in range(horizon_days)}
     overtime_workers = {
@@ -666,4 +702,5 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
         continuity_score=continuity_score,
         labor_cost=labor_cost,
         backlog_cost=backlog_cost,
+        storage_cost=storage_cost,
     )
