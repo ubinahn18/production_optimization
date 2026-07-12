@@ -35,15 +35,34 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import openpyxl
+from openpyxl.utils.datetime import from_excel
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # opt_modeling_proto/ 를 import 경로에 추가
 from scheduling.models import Order
 
 HEADER_ROW = 2
 DATA_START_ROW = 3
+
+# 엑셀상 납기 그대로가 아니라 이만큼 앞당긴 날짜를 프로그램상 마감일로
+# 쓴다 - 실제로는 납기 당일이 아니라 그보다 PRODUCTION_LEAD_DAYS일 먼저
+# 생산을 끝내둬야 미생물 검사가 가능하기 때문. 앞당긴 결과가
+# 1일차(기준일 당일)보다 이르게 나오면(=엑셀 납기가 이미 코앞이라 여유가
+# 5일도 안 남음) 1일차로 clamp한다 - 0/음수 day는 스케줄러가 다루는
+# day index 체계(1-indexed)에 없는 값이라 그대로 넘기면 에러가 난다.
+PRODUCTION_LEAD_DAYS = 5
+
+# 부자재/원료 입고예정일에 더하는 여유일. 입고 당일 바로 생산 가능한 게
+# 아니라 부자재는 검수 등으로 +SUBMATERIAL_LEAD_DAYS일, 원료는 내용물 생산+미생물 검사 시간으로
+#  +RAW_MATERIAL_LEAD_DAYS일이 지나야 실제로 투입 가능하다는
+# 현장 기준. earliest_start_day는 "(부자재입고예정일 + SUBMATERIAL_LEAD_DAYS)
+# vs (원료입고예정일 + RAW_MATERIAL_LEAD_DAYS)" 중 더 늦은 날짜로 정한다
+# (입고일 자체를 그냥 비교하는 게 아님 - 각각 여유일을 더한 "실제 투입
+# 가능일"끼리 비교).
+SUBMATERIAL_LEAD_DAYS = 1
+RAW_MATERIAL_LEAD_DAYS = 7
 
 # 논리 필드 이름 -> 엑셀 헤더 텍스트(공백/줄바꿈 제거 후 비교, _normalize_header 참고).
 # 시트마다 실제 열 번호가 다르므로 이름으로 찾는다.
@@ -102,11 +121,31 @@ class DeadlineResolution:
     detail: str | None = None  # kind=="unresolved"일 때 원본 값 설명(경고 로그용)
 
 
+def _excel_serial_to_date(value: int | float) -> date | None:
+    """날짜 열의 셀 서식이 (원래는 날짜여야 하는데) 회계/숫자 서식 등으로
+    잘못 저장돼서 openpyxl이 datetime 대신 raw 엑셀 시리얼 넘버(정수/실수)를
+    그대로 돌려주는 경우가 실제로 있었다(예: due_date 셀이
+    '_(* #,##0_)...' 회계 서식이라 46294 같은 숫자로 나옴 - 변환해보면
+    2026-09-29처럼 멀쩡한 날짜). 서식과 무관하게 값 자체는 항상 신뢰할 수
+    있으므로, 날짜로 변환 가능한 숫자면 여기서 구제한다. 음수/터무니없이
+    큰 값처럼 애초에 날짜가 아닌 숫자가 섞여 들어온 경우에는 from_excel이
+    예외를 던지므로 그때만 None(해석 불가)으로 처리한다."""
+    try:
+        return from_excel(value).date()
+    except (ValueError, OverflowError, TypeError):
+        return None
+
+
 def _resolve_single_deadline_cell(value) -> DeadlineResolution:
     if isinstance(value, datetime):
         return DeadlineResolution(kind="date", deadline_date=value.date())
     if isinstance(value, date):  # openpyxl이 시간 없는 날짜를 date로 줄 수도 있음
         return DeadlineResolution(kind="date", deadline_date=value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        converted = _excel_serial_to_date(value)
+        if converted is not None:
+            return DeadlineResolution(kind="date", deadline_date=converted)
+        return DeadlineResolution(kind="unresolved", detail=f"날짜로 변환 안 되는 숫자: {value!r}")
     if isinstance(value, str):
         s = value.strip()
         if s.lower() == "asap":
@@ -171,13 +210,16 @@ def _resolve_supply_date(value) -> date | None:
     같은 자유 텍스트가 섞여 들어올 가능성을 배제할 수 없다. 텍스트는
     날짜로 신뢰성 있게 해석할 방법이 없으므로(완료/재고사용처럼 "이미
     준비됨"을 뜻하는 경우도 있고, 애매한 부분 날짜 표기도 있음) 명확한
-    날짜 값(datetime/date)일 때만 해석하고, 그 외는 전부 "제약 없음"으로
-    취급한다 - 조용히 잘못 해석해서 불필요한 생산불가 제약을 거는 것보다
-    안전한 쪽을 택함."""
+    날짜 값일 때만 해석하고, 그 외는 전부 "제약 없음"으로 취급한다 -
+    조용히 잘못 해석해서 불필요한 생산불가 제약을 거는 것보다 안전한
+    쪽을 택함. 숫자(raw 엑셀 시리얼 넘버)도 날짜로 인정한다 - 셀 서식이
+    날짜가 아니게 저장된 경우의 fallback(_excel_serial_to_date 참고)."""
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
         return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _excel_serial_to_date(value)
     return None
 
 
@@ -209,14 +251,20 @@ def load_orders_from_excel(
     두되 category를 "마스크_멀티시트"로 바꿔서 별도 라인 스펙
     (plan_from_orders.py의 CATEGORY_LINE_SPECS)이 적용되게 한다.
 
+    deadline_day: 엑셀 납기 그대로가 아니라 PRODUCTION_LEAD_DAYS일 앞당긴
+    날짜를 쓴다(실제 출고를 위해 납기보다 며칠 먼저 생산을 끝내둬야
+    해서) - 앞당긴 값이 1보다 작아지면 1로 clamp한다.
+
     earliest_start_day: '부자재입고예정일'/'원료입고예정일' 두 열 중 실제
     날짜 값이 있는 쪽을 각각 해석하고(텍스트는 자유 서식이 섞여 있어
-    무시함, _resolve_supply_date 참고), 생산은 포장재(부자재)와 원료가
-    둘 다 들어와야 시작할 수 있으므로 두 날짜 중 더 늦은 날짜를 "이
-    주문의 생산이 가능해지는 첫날"로 계산해서 넣는다(reference_date
-    당일이면 곧바로 1일차부터 가능하므로 제약 없음과 동일 - None으로
-    둠). 계획기간(horizon) 초과 여부는 이 함수가 horizon 길이를 모르므로
-    여기서는 확인하지 않고, 호출하는 쪽(plan_from_orders.py의
+    무시함, _resolve_supply_date 참고), 각각에 여유일(SUBMATERIAL_LEAD_DAYS/
+    RAW_MATERIAL_LEAD_DAYS)을 더한 "실제 투입 가능일"을 구한 다음, 그
+    둘 중 더 늦은 날짜를 "이 주문의 생산이 가능해지는 첫날"로 넣는다
+    (입고예정일 자체를 그냥 비교하는 게 아니라 여유일을 더한 값끼리
+    비교 - 부자재/원료 둘 다 들어와야 생산을 시작할 수 있으므로).
+    reference_date 당일이면 곧바로 1일차부터 가능하므로 제약 없음과
+    동일 - None으로 둠. 계획기간(horizon) 초과 여부는 이 함수가 horizon
+    길이를 모르므로 여기서는 확인하지 않고, 호출하는 쪽(plan_from_orders.py의
     filter_and_attach_rates)에서 처리한다.
     """
     reference_date = reference_date or date.today()
@@ -324,28 +372,31 @@ def load_orders_from_excel(
             if sheet_multiplier != 1:
                 remaining_qty = remaining_qty * sheet_multiplier
 
-            # ---- deadline_day 계산 ----
+            # ---- deadline_day 계산 (엑셀 납기 - PRODUCTION_LEAD_DAYS일) ----
             deadline_day: int | None
             if deadline.kind == "asap":
                 deadline_day = None
             else:
-                deadline_day = (deadline.deadline_date - reference_date).days + 1
+                raw_deadline_day = (deadline.deadline_date - reference_date).days + 1
+                deadline_day = max(1, raw_deadline_day - PRODUCTION_LEAD_DAYS)
 
-            # ---- earliest_start_day 계산(부자재/원료 입고일 중 더 늦은 날짜) ----
-            # 생산은 포장재(부자재)와 원료가 둘 다 도착해야 시작할 수 있으므로,
-            # 두 열 각각 해석한 뒤 더 늦은 날짜를 기준으로 삼는다.
-            supply_dates = [
-                d
-                for d in (
-                    _resolve_supply_date(cell("submaterial_date", r)),
-                    _resolve_supply_date(cell("raw_material_date", r)),
-                )
-                if d is not None
-            ]
+            # ---- earliest_start_day 계산 ----
+            # 부자재/원료 둘 다 도착해야 생산을 시작할 수 있으므로, 각각
+            # 입고예정일에 여유일(SUBMATERIAL_LEAD_DAYS/RAW_MATERIAL_LEAD_DAYS)을
+            # 더한 "실제 투입 가능일"을 구한 뒤 그 중 더 늦은 날짜를 쓴다
+            # (입고예정일 자체를 그냥 비교하는 게 아님).
+            ready_dates = []
+            submaterial_date = _resolve_supply_date(cell("submaterial_date", r))
+            if submaterial_date is not None:
+                ready_dates.append(submaterial_date + timedelta(days=SUBMATERIAL_LEAD_DAYS))
+            raw_material_date = _resolve_supply_date(cell("raw_material_date", r))
+            if raw_material_date is not None:
+                ready_dates.append(raw_material_date + timedelta(days=RAW_MATERIAL_LEAD_DAYS))
+
             earliest_start_day: int | None = None
-            if supply_dates:
-                latest_supply_date = max(supply_dates)
-                candidate = (latest_supply_date - reference_date).days + 1
+            if ready_dates:
+                latest_ready_date = max(ready_dates)
+                candidate = (latest_ready_date - reference_date).days + 1
                 if candidate > 1:  # 1일차(오늘)부터 가능하면 사실상 제약 없음과 동일
                     earliest_start_day = candidate
 
@@ -453,8 +504,8 @@ if __name__ == "__main__":
 
     if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
         import io
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 
     parser = argparse.ArgumentParser(description="수주진행현황 엑셀 -> Order 목록 변환")
     parser.add_argument("path", help="수주진행현황 엑셀 파일 경로")
