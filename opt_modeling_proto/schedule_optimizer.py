@@ -59,8 +59,8 @@ import sys
 # 에러 스트림을 UTF-8로 강제로 다시 감싼다. (파일 저장은 to_csv에서 별도로
 # utf-8-sig를 지정하므로 이 처리와 무관하게 항상 정상 저장된다.)
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 
 from scheduling.example_data import build_example_instance, load_data_from_json
 from scheduling.models import ScheduleConfig
