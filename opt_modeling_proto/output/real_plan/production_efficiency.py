@@ -45,8 +45,8 @@ import pandas as pd
 
 # Windows 콘솔(cp949 등) 기본 인코딩에서는 한글 출력이 깨지므로 UTF-8로 강제.
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 
 # 이 파일은 output/real_plan/ 안에 있으므로, opt_modeling_proto/(scheduling
 # 패키지 + plan_from_orders.py)와 output/(_data_source.py) 둘 다 import
@@ -68,6 +68,7 @@ def compute_efficiency(
     daily_workforce: pd.DataFrame,
     rate_lookup: dict[tuple[str, str], float],
     order_category: dict[str, str],
+    weight_container_tube: float = WEIGHT_CONTAINER_TUBE,
 ) -> dict:
     """전체 계획기간에 대해 카테고리별 총생산량 + 총 작업인원수 + 최종
     지표값을 딕셔너리로 반환한다."""
@@ -121,7 +122,7 @@ def compute_efficiency(
 
     total_workforce = daily_workforce["workforce"].sum()
 
-    numerator = (container_qty + tube_qty) * WEIGHT_CONTAINER_TUBE + mask_qty
+    numerator = (container_qty + tube_qty) * weight_container_tube + mask_qty
     efficiency = numerator / total_workforce if total_workforce else float("nan")
 
     return {
@@ -145,6 +146,10 @@ def main():
                          help="plan_from_orders.py를 돌릴 때 쓴 기준일(YYYY-MM-DD, 생략하면 오늘) - "
                               "rate/workers 값을 다시 만드는 데만 쓰이고 CP-SAT을 다시 돌리지는 않음")
     parser.add_argument("--excel-path", default=None, help="수주진행현황 엑셀 경로(생략하면 기본 경로)")
+    parser.add_argument(
+        "--weight-container-tube", type=float, default=WEIGHT_CONTAINER_TUBE,
+        help=f"(용기+튜브) 생산량에 곱하는 가중치 (기본 {WEIGHT_CONTAINER_TUBE})",
+    )
     args = parser.parse_args()
 
     ref = date.fromisoformat(args.reference_date) if args.reference_date else None
@@ -159,7 +164,8 @@ def main():
     schedule = pd.read_csv(os.path.join(args.dir, "line_schedule.csv"))
     daily_workforce = pd.read_csv(os.path.join(args.dir, "daily_workforce.csv"))
 
-    r = compute_efficiency(schedule, daily_workforce, rate_lookup, order_category)
+    r = compute_efficiency(schedule, daily_workforce, rate_lookup, order_category,
+                            weight_container_tube=args.weight_container_tube)
 
     print(f"용기 생산량: {r['container_qty']:,.0f}개")
     print(f"튜브 생산량: {r['tube_qty']:,.0f}개")
@@ -167,7 +173,7 @@ def main():
     if r["other_qty"]:
         print(f"(기타 제품군 생산량: {r['other_qty']:,.0f}개 - 지표 계산에는 포함 안 됨)")
     print(f"총 작업인원수(인원-일): {r['total_workforce']:,.0f}명")
-    print(f"분자 {{(용기+튜브)*{WEIGHT_CONTAINER_TUBE}+마스크}}: {r['numerator']:,.1f}")
+    print(f"분자 {{(용기+튜브)*{args.weight_container_tube}+마스크}}: {r['numerator']:,.1f}")
     print(f"\n지표값: {r['efficiency']:.4f}")
 
 
