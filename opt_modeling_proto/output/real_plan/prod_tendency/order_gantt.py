@@ -88,8 +88,11 @@ def plot_order(
     day_index = {d: i for i, d in enumerate(days)}
     T = len(days) * len(SLOT_LABELS)
 
-    # 0=idle, 1=다른 주문 작업 중, 2=셋업(이 주문), 3=생산(이 주문)
-    base_colors = ["#f2f2f2", "#c9c9c9", "#f0ad4e", "#2e7d32"]
+    # 0=idle, 1=다른 주문 생산, 2=다른 주문 셋업, 3=셋업(이 주문), 4=생산(이 주문)
+    # "다른 주문 셋업"을 "다른 주문 생산"과 다른 회색 진하기로 분리해서,
+    # 이 주문 블록 앞뒤에 다른 주문의 셋업이 실제로 끼워져 있는지(라인
+    # 전환이 셋업 없이 일어나지 않는지) 그림만 보고 바로 확인할 수 있게 함.
+    base_colors = ["#f2f2f2", "#c9c9c9", "#6e6e6e", "#f0ad4e", "#2e7d32"]
     cmap = ListedColormap(base_colors)
     norm = BoundaryNorm(list(range(len(base_colors) + 1)), cmap.N)
 
@@ -102,9 +105,9 @@ def plot_order(
         if row.activity == "idle":
             grid[r, c] = 0
         elif row.order_id == order_id:
-            grid[r, c] = 3 if row.activity == "produce" else 2
+            grid[r, c] = 4 if row.activity == "produce" else 3
         else:
-            grid[r, c] = 1
+            grid[r, c] = 2 if row.activity == "setup" else 1
 
     fig_w = max(12, T / 25)
     fig_h = max(3, 0.5 * len(relevant_lines) + 1.5)
@@ -131,9 +134,10 @@ def plot_order(
 
     legend_items = [
         Patch(facecolor=base_colors[0], edgecolor="gray", label="대기(idle)"),
-        Patch(facecolor=base_colors[1], label="다른 주문 작업 중"),
-        Patch(facecolor=base_colors[2], label="셋업(이 주문)"),
-        Patch(facecolor=base_colors[3], label=f"생산: {order_id}"),
+        Patch(facecolor=base_colors[1], label="다른 주문 생산"),
+        Patch(facecolor=base_colors[2], label="다른 주문 셋업"),
+        Patch(facecolor=base_colors[3], label="셋업(이 주문)"),
+        Patch(facecolor=base_colors[4], label=f"생산: {order_id}"),
     ]
     if has_deadline:
         from matplotlib.lines import Line2D

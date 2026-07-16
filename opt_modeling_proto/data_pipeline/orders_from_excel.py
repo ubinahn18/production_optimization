@@ -43,8 +43,8 @@ from openpyxl.utils.datetime import from_excel
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # opt_modeling_proto/ 를 import 경로에 추가
 from scheduling.models import Order
 
-HEADER_ROW = 2
-DATA_START_ROW = 3
+HEADER_ROW = 5
+DATA_START_ROW = 6
 
 # 엑셀상 납기 그대로가 아니라 이만큼 앞당긴 날짜를 프로그램상 마감일로
 # 쓴다 - 실제로는 납기 당일이 아니라 그보다 PRODUCTION_LEAD_DAYS일 먼저
@@ -88,6 +88,28 @@ COLUMN_ALIASES: dict[str, list[str]] = {
 # 있지만(예: "용기 9/12, 단상자 9/11..."), 그런 진행중 메모는 스케줄링
 # 대상에서 뺄 이유가 없으므로 정확히 이 값들과 일치할 때만 제외한다.
 EXCLUDED_STATUSES = {"생산완료", "출고완료", "수주취소", "취소됨"}
+
+# 제품(행)별로 호환되는 라인타입마다 rpm/시간당 Capa(rate)/동시 투입인원(workers)을
+# 적어두는 5개 컬럼 그룹(셀라인/단발/10열기/로타리/튜브라인 순서, 각 3열씩
+# T~AH). --read-specs excel 모드에서만 쓰인다(plan_from_orders.py 참고).
+#
+# COLUMN_ALIASES처럼 헤더 텍스트로 못 찾고 고정 열 번호로 찾는 이유: 이
+# 5개 그룹의 헤더가 전부 "rpm"/"시간당 Capa"/"동시 작업인원 수(명)"로
+# 동일해서(엑셀 원본이 실제로 이렇게 돼 있음) _resolve_columns의 "헤더
+# 텍스트 -> 열 번호" 방식으로는 그룹을 구분할 수 없다 - 5번 다 같은 키로
+# 덮어써져서 마지막(튜브라인) 것만 남아버림. 그래서 이 5개 그룹만
+# 예외적으로 위치 고정 방식을 쓴다(사용자가 직접 확인해서 알려준 위치:
+# T/U/V, W/X/Y, Z/AA/AB, AC/AD/AE, AF/AG/AH). 시트 레이아웃이 바뀌면
+# 조용히 엉뚱한 값을 읽을 수 있으므로, load_orders_from_excel이 매번
+# 헤더 텍스트가 예상과 맞는지 확인해서 안 맞으면 경고를 남긴다.
+LINE_SPEC_COLUMNS: dict[str, tuple[int, int, int]] = {
+    # line_type_id: (rpm 열, 시간당Capa/rate 열, 동시투입인원/workers 열) - 1-indexed
+    "셀라인": (20, 21, 22),      # T, U, V
+    "단발": (23, 24, 25),        # W, X, Y
+    "10열기": (26, 27, 28),      # Z, AA, AB
+    "로타리": (29, 30, 31),      # AC, AD, AE
+    "튜브라인": (32, 33, 34),    # AF, AG, AH
+}
 
 
 def _normalize_header(text) -> str:
@@ -185,6 +207,42 @@ def _to_number(value) -> float | None:
     return None
 
 
+def _extract_line_specs(ws, row: int) -> tuple[dict[str, float], dict[str, int]]:
+    """LINE_SPEC_COLUMNS(T~AH)에서 이 행(제품)이 실제로 호환되는
+    라인타입별 rate(시간당 생산량)/workers(필요인원)를 읽는다. 시간당
+    Capa가 비어 있거나 0 이하면 그 라인타입은 호환 안 되는 것으로 보고
+    dict에 아예 안 넣는다(Order.compatible_line_types()가 rate>0인
+    항목만 세므로 자연히 빠짐)."""
+    rate: dict[str, float] = {}
+    workers: dict[str, int] = {}
+    for line_type_id, (_rpm_col, capa_col, workers_col) in LINE_SPEC_COLUMNS.items():
+        capa = _to_number(ws.cell(row=row, column=capa_col).value)
+        if capa is None or capa <= 0:
+            continue
+        rate[line_type_id] = capa
+        workers[line_type_id] = int(_to_number(ws.cell(row=row, column=workers_col).value) or 0)
+    return rate, workers
+
+
+def _check_line_spec_headers(ws) -> list[str]:
+    """LINE_SPEC_COLUMNS가 가리키는 고정 열 위치의 헤더 텍스트가 실제로
+    rpm/시간당Capa/동시투입인원인지 확인한다(위치 고정 방식이라 시트
+    레이아웃이 바뀌면 조용히 엉뚱한 값을 읽을 위험이 있어서, 매번 확인
+    후 안 맞으면 경고 문자열 목록을 돌려준다)."""
+    problems = []
+    for line_type_id, (rpm_col, capa_col, workers_col) in LINE_SPEC_COLUMNS.items():
+        rpm_header = _normalize_header(ws.cell(row=HEADER_ROW, column=rpm_col).value)
+        capa_header = _normalize_header(ws.cell(row=HEADER_ROW, column=capa_col).value)
+        workers_header = _normalize_header(ws.cell(row=HEADER_ROW, column=workers_col).value)
+        if "rpm" not in rpm_header.lower():
+            problems.append(f"{line_type_id}: rpm 열({rpm_col}) 헤더가 예상과 다름({rpm_header!r})")
+        if "Capa" not in capa_header:
+            problems.append(f"{line_type_id}: 시간당Capa 열({capa_col}) 헤더가 예상과 다름({capa_header!r})")
+        if "작업인원" not in workers_header:
+            problems.append(f"{line_type_id}: 동시투입인원 열({workers_col}) 헤더가 예상과 다름({workers_header!r})")
+    return problems
+
+
 # "5매입", "(10매)", "10+1매/자급"처럼 품명에 붙는 매수 표기를 찾는다.
 # "+"로 여러 숫자가 이어진 경우(예: "10+1매") 그 합을 매수로 본다.
 _SHEET_COUNT_RE = re.compile(r"(\d+(?:\+\d+)*)\s*매")
@@ -227,8 +285,15 @@ def load_orders_from_excel(
     path: str,
     reference_date: date | None = None,
     verbose: bool = True,
-) -> list[Order]:
-    """수주진행현황 엑셀을 읽어서 필터링된 Order 목록을 반환한다.
+    read_specs_from_excel: bool = False,
+) -> tuple[list[Order], dict]:
+    """수주진행현황 엑셀을 읽어서 필터링된 (Order 목록, 요약 통계 dict)를 반환한다.
+
+    stats 키: scanned/excluded_status/excluded_deadline_passed/
+    excluded_deadline_unresolved/excluded_nonpositive_qty/included
+    (plan_from_orders.py의 plan_report 엑셀에서 제외 사유별 개수를
+    보여줄 때 씀 - filter_and_attach_rates의 2차 필터 stats와 합쳐서
+    쓰인다).
 
     필터: (reference_date 기준 납기가 아직 안 지났음 OR 납기가 ASAP)
           AND (상태가 EXCLUDED_STATUSES에 없음)
@@ -238,10 +303,13 @@ def load_orders_from_excel(
     변환해서 넣는다(reference_date 당일이 마감이면 deadline_day=1) -
     scheduling.models.Order.deadline_day의 정의(1-indexed) 그대로.
 
-    rate/workers는 이 시점엔 알 수 없으므로 빈 dict로 둔다 - 어느 라인이
-    이 주문을 만들 수 있고 속도/인원이 얼마인지는 별도 단계(각 기계가
-    각 주문을 만들 때 rate/worker가 얼마인지 계산하는 스크립트)에서
-    채워 넣는다.
+    rate/workers: read_specs_from_excel=False(기본)면 이 시점엔 알 수
+    없으므로 빈 dict로 두고, 호출하는 쪽(plan_from_orders.py의
+    filter_and_attach_rates)이 제품군(category) 기준으로 채워 넣는다.
+    read_specs_from_excel=True면 여기서 바로 LINE_SPEC_COLUMNS(T~AH,
+    라인타입별 rpm/시간당Capa/동시투입인원)를 읽어서 채운다 - 제품군이
+    아니라 그 행(제품) 자체에 적힌 실측값을 쓰는 방식. 어느 쪽을 쓸지는
+    plan_from_orders.py의 --read-specs 플래그로 고른다.
 
     category 보정 + 멀티시트 처리: '제품군'이 "파우치"면 "마스크"로
     바꾼다. 그 결과 category가 "마스크"인 행은 '품명'에서 "(숫자)매"
@@ -303,6 +371,14 @@ def load_orders_from_excel(
         missing = [f for f, c in cols.items() if c is None]
         if missing:
             warnings.append(f"[{sheet_name}] 헤더에서 못 찾은 필드(이 시트에서는 해당 값 없음 취급): {missing}")
+        if read_specs_from_excel:
+            header_problems = _check_line_spec_headers(ws)
+            if header_problems:
+                warnings.append(
+                    f"[{sheet_name}] --read-specs excel 모드인데 라인별 rpm/시간당Capa/동시투입인원 "
+                    f"열 위치가 예상과 다릅니다(시트 레이아웃 변경 의심, LINE_SPEC_COLUMNS 확인 필요): "
+                    + "; ".join(header_problems)
+                )
 
         def cell(field: str, row: int):
             c = cols[field]
@@ -405,6 +481,11 @@ def load_orders_from_excel(
             vendor_raw = cell("vendor", r)
             product_name_raw = cell("product_name", r)
 
+            if read_specs_from_excel:
+                rate, workers = _extract_line_specs(ws, r)
+            else:
+                rate, workers = {}, {}
+
             orders.append(
                 Order(
                     order_id=order_id,
@@ -415,8 +496,8 @@ def load_orders_from_excel(
                     vendor=str(vendor_raw).strip() if vendor_raw is not None else "",
                     deadline_day=deadline_day,
                     earliest_start_day=earliest_start_day,
-                    rate={},
-                    workers={},
+                    rate=rate,
+                    workers=workers,
                 )
             )
             stats["included"] += 1
@@ -435,7 +516,7 @@ def load_orders_from_excel(
             if len(warnings) > 50:
                 print(f"  ... 외 {len(warnings) - 50}건 더")
 
-    return orders
+    return orders, stats
 
 
 def _make_order_id(
@@ -519,7 +600,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     ref = date.fromisoformat(args.reference_date) if args.reference_date else None
-    result = load_orders_from_excel(args.path, reference_date=ref)
+    result, _stats = load_orders_from_excel(args.path, reference_date=ref)
     print(f"\n총 {len(result)}건의 Order 반환됨. 처음 5건:")
     for o in result[:5]:
         print(f"  {o.order_id} | {o.product_id} | {o.category} | qty={o.quantity} | deadline_day={o.deadline_day}")

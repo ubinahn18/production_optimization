@@ -80,7 +80,6 @@ def plot_day(
         raise ValueError(f"day={day}에 해당하는 행이 없습니다(line_schedule.csv의 day 범위를 확인하세요).")
 
     # 라인별로 그 날의 행만 모으고, 하루 종일 idle뿐인 라인은 아예 제외.
-    # groupby(sort=False)로 CSV에 나온 순서(=원래 라인 그룹 순서)를 유지한다.
     line_ids: list[str] = []
     per_line: dict[str, pd.DataFrame] = {}
     for lid, g in day_df.groupby("line_id", sort=False):
@@ -88,6 +87,7 @@ def plot_day(
             continue
         per_line[lid] = g.set_index("slot")
         line_ids.append(lid)
+    line_ids.sort()  # 스크립트마다 라인 순서가 제각각이면 비교하기 어려우므로 가나다순으로 통일
     if not line_ids:
         raise ValueError(f"day={day}에 활동 중인 라인이 하나도 없습니다.")
 

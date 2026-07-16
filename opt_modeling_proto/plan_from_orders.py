@@ -37,11 +37,12 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 
 from data_pipeline.orders_from_excel import load_orders_from_excel
+from plan_report import write_plan_report_excel
 from scheduling.models import Line, Order, ScheduleConfig
 from scheduling.report import plot_gantt, print_report, save_outputs
 from scheduling.solver import build_and_solve
 
-DEFAULT_EXCEL_PATH = r"C:\Users\USER\production_opt\수주진행현황(simulation_DATA_2).xlsx"
+DEFAULT_EXCEL_PATH = r"C:\Users\USER\production_opt\수주현황_시뮬_filled01_0713.xlsx"
 
 # 제품군(category)별로 사용 가능한 라인 타입 + 그 라인에서 이 제품군을
 # 생산할 때 필요한 인원(workers)/시간당 생산량(rate). "같은 제품군이면
@@ -65,7 +66,7 @@ CATEGORY_LINE_SPECS: dict[str, list[dict]] = {
         {"line_type_id": "로타리", "count": 2, "workers": 7, "rate": 3000},
     ],
     "튜브": [
-        {"line_type_id": "튜브라인", "count": 3, "workers": 10, "rate": 2100},
+        {"line_type_id": "튜브라인", "count": 4, "workers": 10, "rate": 2100},
     ],
     # 발주처가 "셀바이오휴먼텍"이고 품명에 "사각패드"가 들어가는 제품
     # 전용 라인. 엑셀상 category(제품군)는 "용기"로 찍혀 있지만 실제로는
@@ -153,16 +154,29 @@ def build_lines() -> list[Line]:
 # 지금은 그냥 line_type_id 가 rate와 workers를 결정하도록 했으니까 모든 order에 대해서 category만 읽으면 자동으로 
 # o.rate와 o.workers 딕셔너리가 채워짐. 나중에는 채우는 걸 따로 할 것임
 
-def filter_and_attach_rates(orders: list[Order]) -> tuple[list[Order], dict[str, int]]:
-    """category가 CATEGORY_LINE_SPECS에 없는 주문(마스크/튜브/용기/셀바이오
-    예외가 아닌 벌크/파우치/샤쉐 등)과 납기가 계획기간을 너무 벗어난
-    주문을 걸러내고, 남은 주문에는 그 제품군(또는 셀바이오 예외)의
-    rate/workers를 채워 넣는다(orders_from_excel.py가 만드는 Order는
-    rate/workers가 항상 빈 dict라서 여기서 처음 채워짐).
+def filter_and_attach_rates(
+    orders: list[Order], read_specs_from_excel: bool = False
+) -> tuple[list[Order], dict[str, int]]:
+    """호환 라인이 없는 주문과 납기가 계획기간을 너무 벗어난 주문을
+    걸러내고, 남은 주문에 rate/workers를 채워 넣는다.
 
-    셀바이오 예외: 발주처가 CELLBIO_VENDOR이고 품명에
-    CELLBIO_PRODUCT_KEYWORD가 들어가면 category(엑셀상 "용기")와 무관하게
-    "셀바이오_사각패드" spec(전용 라인 1대)을 배정한다.
+    rate/workers 출처는 read_specs_from_excel로 고른다(plan_from_orders.py의
+    --read-specs 플래그, 기본은 False=category 방식):
+      - False(category, 기존 방식): category가 CATEGORY_LINE_SPECS에 없는
+        주문(마스크/튜브/용기/셀바이오 예외가 아닌 벌크/파우치/샤쉐 등)을
+        제외하고, 남은 주문에 그 제품군의 rate/workers를 채운다
+        (orders_from_excel.py가 만드는 Order는 rate/workers가 항상 빈
+        dict라서 여기서 처음 채워짐).
+      - True(excel): orders_from_excel.py가 read_specs_from_excel=True로
+        이미 채워둔 제품별 rate/workers(엑셀의 라인별 rpm/시간당Capa/
+        동시투입인원 컬럼에서 읽은 값)를 그대로 쓴다 - 여기서는 다시
+        채우지 않고, 호환 라인이 하나도 없는(rate가 빈 dict인) 주문만
+        제외한다.
+    둘 중 어느 쪽이든, 셀바이오 예외(발주처가 CELLBIO_VENDOR이고 품명에
+    CELLBIO_PRODUCT_KEYWORD가 들어감)는 category/엑셀 컬럼과 무관하게
+    항상 "셀바이오_사각패드" spec(전용 라인 1대)을 배정한다 - 엑셀의
+    라인별 컬럼(T~AH)은 표준 5개 라인타입만 다루고 셀바이오 전용 라인은
+    거기 없기 때문.
 
     납기 ramp: 납기가 EARLY_RAMP_DAYS(1~5일차)면 수량의 EARLY_RAMP_FRACTION만
     반영하고(나머지는 지난 계획주기에 이미 생산했다고 가정), 납기가
@@ -185,13 +199,19 @@ def filter_and_attach_rates(orders: list[Order]) -> tuple[list[Order], dict[str,
         "included": 0,
     }
     for o in orders:
-        if o.vendor.strip() == CELLBIO_VENDOR and CELLBIO_PRODUCT_KEYWORD in o.product_name:
+        is_cellbio = o.vendor.strip() == CELLBIO_VENDOR and CELLBIO_PRODUCT_KEYWORD in o.product_name
+        if is_cellbio:
             specs = CATEGORY_LINE_SPECS["셀바이오_사각패드"]
+        elif read_specs_from_excel:
+            specs = None  # rate/workers는 orders_from_excel.py에서 이미 채워짐 - 아래서 그대로 씀
+            if not o.rate:
+                stats["excluded_category"] += 1
+                continue
         else:
             specs = CATEGORY_LINE_SPECS.get(o.category)
-        if specs is None:
-            stats["excluded_category"] += 1
-            continue
+            if specs is None:
+                stats["excluded_category"] += 1
+                continue
 
         if o.deadline_day is not None:
             if o.deadline_day > MAX_DEADLINE_DAY + LATE_RAMP_DAYS:
@@ -208,8 +228,9 @@ def filter_and_attach_rates(orders: list[Order]) -> tuple[list[Order], dict[str,
 
         if o.earliest_start_day is not None and o.earliest_start_day > MAX_DEADLINE_DAY:
             o.earliest_start_day = None
-        o.rate = {s["line_type_id"]: s["rate"] for s in specs}
-        o.workers = {s["line_type_id"]: s["workers"] for s in specs}
+        if specs is not None:  # cellbio, 또는 category 방식 - excel 방식이면 이미 채워져 있어서 건드릴 필요 없음
+            o.rate = {s["line_type_id"]: s["rate"] for s in specs}
+            o.workers = {s["line_type_id"]: s["workers"] for s in specs}
         kept.append(o)
     stats["included"] = len(kept)
     return kept, stats
@@ -245,6 +266,12 @@ def main():
     parser = argparse.ArgumentParser(description="실제 수주 데이터 기반 생산 스케줄링 (CP-SAT)")
     parser.add_argument("--excel-path", default=DEFAULT_EXCEL_PATH, help="수주진행현황 엑셀 경로")
     parser.add_argument("--reference-date", default=None, help="기준일(YYYY-MM-DD, 생략하면 오늘)")
+    parser.add_argument(
+        "--read-specs", choices=["category", "excel"], default="category",
+        help="라인별 rate(시간당 생산량)/투입인원을 어디서 가져올지. "
+             "category(기본): CATEGORY_LINE_SPECS에서 제품군 기준으로 가져옴(기존 방식). "
+             "excel: 엑셀의 제품별 라인별 rpm/시간당Capa/동시투입인원 컬럼(T~AH)에서 직접 읽음.",
+    )
     parser.add_argument("--horizon-days", type=int, default=MAX_DEADLINE_DAY)
     parser.add_argument("--daily-wage", type=float, default=120_000, help="1인 1일 고용 정액임금")
     parser.add_argument("--hourly-wage", type=float, default=None, help="잔업수당 계산용 시급 (미지정시 daily-wage/8)")
@@ -255,6 +282,11 @@ def main():
     )
     parser.add_argument("--time-limit", type=float, default=60.0, help="1단계(인건비 최소화) CP-SAT 탐색 제한시간(초)")
     parser.add_argument(
+        "--log-progress", action="store_true",
+        help="CP-SAT 탐색 로그를 실시간으로 콘솔에 출력(기본은 꺼짐) - "
+             "시간제한을 길게 줬는데 왜 안 끝나는지 확인할 때 유용",
+    )
+    parser.add_argument(
         "--secondary-time-limit", type=float, default=60.0,
         help="2단계(연속성 최적화) CP-SAT 탐색 제한시간(초)",
     )
@@ -263,6 +295,7 @@ def main():
         help="2단계 연속성 최적화를 생략하고 1단계(순수 비용 최소화) 결과만 사용",
     )
     parser.add_argument("--no-plot", action="store_true", help="간트 차트 PNG 생성 생략")
+    parser.add_argument("--no-excel-report", action="store_true", help="plan_report.xlsx 생성 생략")
     parser.add_argument(
         "--output-dir",
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "real_plan"),
@@ -278,12 +311,16 @@ def main():
     args = parser.parse_args()
 
     reference_date = date.fromisoformat(args.reference_date) if args.reference_date else date.today()
-    raw_orders = load_orders_from_excel(args.excel_path, reference_date=reference_date)
+    read_specs_from_excel = args.read_specs == "excel"
+    raw_orders, load_stats = load_orders_from_excel(
+        args.excel_path, reference_date=reference_date, read_specs_from_excel=read_specs_from_excel,
+    )
 
-    orders, stats = filter_and_attach_rates(raw_orders)
+    orders, stats = filter_and_attach_rates(raw_orders, read_specs_from_excel=read_specs_from_excel)
+    print(f"[정보] rate/투입인원 출처: {args.read_specs}")
     print(
         f"[정보] 엑셀 기반 주문 {stats['total']}건 -> "
-        f"제품군(마스크/튜브/용기/셀바이오 아님) 제외 {stats['excluded_category']}건, "
+        f"제품군/호환라인 없음으로 제외 {stats['excluded_category']}건, "
         f"납기 {MAX_DEADLINE_DAY + LATE_RAMP_DAYS}일 초과 제외 {stats['excluded_deadline']}건, "
         f"ramp 반영 후 잔량0이하 제외 {stats['excluded_nonpositive_qty']}건 "
         f"-> 최종 {stats['included']}건"
@@ -312,6 +349,7 @@ def main():
         default_backlog_cost_per_unit_per_day=args.backlog_cost,
         storage_cost_by_category=CATEGORY_STORAGE_COST,
         closed_days=closed_days,
+        log_progress=args.log_progress,
     )
     print(
         f"[정보] 임금 설정: 일급 {config.daily_wage:,.0f} / 시급(잔업기준) "
@@ -326,6 +364,12 @@ def main():
     save_outputs(result, orders, args.output_dir)
     if not args.no_plot:
         plot_gantt(result, orders, config, args.output_dir)
+    if not args.no_excel_report:
+        write_plan_report_excel(
+            result, orders, lines, config, reference_date, load_stats, stats,
+            os.path.join(args.output_dir, "plan_report.xlsx"),
+            deadline_window_days=MAX_DEADLINE_DAY + LATE_RAMP_DAYS,
+        )
 
 
 if __name__ == "__main__":

@@ -154,7 +154,7 @@ def main():
 
     ref = date.fromisoformat(args.reference_date) if args.reference_date else None
     excel_path = args.excel_path or pfo.DEFAULT_EXCEL_PATH
-    raw_orders = pfo.load_orders_from_excel(excel_path, reference_date=ref, verbose=False)
+    raw_orders, _load_stats = pfo.load_orders_from_excel(excel_path, reference_date=ref, verbose=False)
     orders, _stats = pfo.filter_and_attach_rates(raw_orders)
     lines = pfo.build_lines()
 

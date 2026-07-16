@@ -25,7 +25,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-DEFAULT_EXCEL = r"C:\Users\USER\production_opt\수주진행현황(simulation_DATA_2).xlsx"
+DEFAULT_EXCEL = r"C:\Users\USER\production_opt\수주진행현황(Template_양식_20260713).xlsx"
 DEFAULT_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 SHEET_NAME = "2026년07월"
 
@@ -44,7 +44,8 @@ SERIES_BLUE = "#2a78d6"
 
 
 def load_data(excel_path):
-    df = pd.read_excel(excel_path, sheet_name=SHEET_NAME, header=1)
+    # 헤더가 5행(1~4행은 설명 텍스트) - pandas header는 0-indexed라 4.
+    df = pd.read_excel(excel_path, sheet_name=SHEET_NAME, header=4)
     due = pd.to_datetime(df[DUE_COL], errors="coerce")
     submat = pd.to_datetime(df[SUBMAT_COL], errors="coerce")
     material = pd.to_datetime(df[MATERIAL_COL], errors="coerce")

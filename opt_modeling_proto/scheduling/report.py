@@ -175,10 +175,11 @@ def plot_gantt(result: ScheduleResult, orders: list[Order], config: ScheduleConf
     # 동일 라인이 많은 그룹(예: 단발 19대)에서 실제로 쓰인 몇 대만 빼고
     # 나머지가 전부 회색 idle 줄로 차트를 채워서 정작 중요한 부분이
     # 안 보이게 되는 걸 막기 위함.
-    line_ids = [
+    # 스크립트마다 라인 순서가 제각각이면 비교하기 어려우므로 가나다순으로 통일.
+    line_ids = sorted(
         lid for lid, entries in result.line_activity.items()
         if any(activity != "idle" for _, _, activity, _ in entries)
-    ]
+    )
     T = config.horizon_days * SLOTS_PER_DAY
     # 색상/범례는 order_id(주문) 단위로 나눈다 - product_id는 진짜 식별자가
     # 아니라 제품 "이름"이라서 여러 주문이 같은 값을 공유할 수 있다(예:
@@ -217,7 +218,14 @@ def plot_gantt(result: ScheduleResult, orders: list[Order], config: ScheduleConf
     norm = BoundaryNorm(bounds, cmap.N)
 
     fig_w = max(12, T / 25)
-    fig_h = max(3, 0.5 * len(line_ids) + 1.5)
+    # 마감일 라벨(아래 참고)을 적을 여백을 라인 수와 무관하게 고정 인치로
+    # 따로 확보한다 - 예전엔 라벨 길이가 얼마든 상관없이 ylim만 살짝
+    # 늘리고 fig_h는 라인 수로만 정했는데, 같은 날짜에 마감인 주문이
+    # 많아서 라벨 문자열(세로 회전)이 길어지면 fig.tight_layout()이 그
+    # 긴 텍스트를 다 담으려고 실제 차트(축) 영역을 억지로 눌러 찌그러뜨려
+    # 버리는 문제가 실제로 있었다(라인이 많을수록 더 심함).
+    DEADLINE_LABEL_MARGIN_INCHES = 2.5
+    fig_h = max(3, 0.5 * len(line_ids) + 1.5) + DEADLINE_LABEL_MARGIN_INCHES
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.imshow(grid, aspect="auto", cmap=cmap, norm=norm, interpolation="none")
 
@@ -227,6 +235,10 @@ def plot_gantt(result: ScheduleResult, orders: list[Order], config: ScheduleConf
     # 주문 마감일을 빨간 점선으로 표시. 같은 날짜가 마감인 주문이 여러 개면
     # 점선 하나로 묶고 그 위에 해당 product_id들을 세로로 적어둔다.
     # ASAP 주문(deadline_day=None)은 하드 마감이 없으므로 여기서는 그린다.
+    # 라벨에 적는 product_id 개수를 제한한다(위 fig_h 주석 참고 - 같은
+    # 날짜에 몰린 주문이 많을 때 라벨 텍스트가 무한정 길어지는 걸 막기
+    # 위함) - 넘치는 만큼은 "+N개"로 요약.
+    MAX_DEADLINE_LABEL_ITEMS = 4
     deadlines_by_day: dict[int, list[str]] = {}
     for o in orders:
         if o.deadline_day is None:
@@ -235,7 +247,12 @@ def plot_gantt(result: ScheduleResult, orders: list[Order], config: ScheduleConf
     for d, product_ids_due in deadlines_by_day.items():
         x = d * SLOTS_PER_DAY - 0.5  # 그 날짜의 마지막 슬롯 바로 뒤 경계선 = 마감 시점
         ax.axvline(x, color="red", linestyle="--", linewidth=1.3, alpha=0.9, zorder=5)
-        ax.text(x, -0.6, ",".join(product_ids_due), color="red", fontsize=7,
+        if len(product_ids_due) > MAX_DEADLINE_LABEL_ITEMS:
+            shown = product_ids_due[:MAX_DEADLINE_LABEL_ITEMS]
+            label = ",".join(shown) + f"+{len(product_ids_due) - MAX_DEADLINE_LABEL_ITEMS}개"
+        else:
+            label = ",".join(product_ids_due)
+        ax.text(x, -0.6, label, color="red", fontsize=7,
                 rotation=90, ha="right", va="bottom")
     ax.set_ylim(len(line_ids) - 0.5, -2.5)  # 위쪽에 마감일 라벨 적을 여백 확보
 
