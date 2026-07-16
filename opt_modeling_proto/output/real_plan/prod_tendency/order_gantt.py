@@ -54,29 +54,15 @@ SLOT_ORDER = {s: i for i, s in enumerate(SLOT_LABELS)}
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*]')
 
 
-def plot_order(
-    schedule: pd.DataFrame,
-    order_id: str,
-    out_path: str,
-    deadline_day: float | None = None,
-) -> int:
-    """schedule(line_schedule.csv를 그대로 읽은 DataFrame)에서 order_id가
-    한 번이라도 등장하는 라인만 골라, 계획기간 전체를 행=라인/열=시간슬롯
-    그리드로 그려 out_path에 저장한다. 반환값은 표시된 라인 개수.
-    order_id가 아예 등장하지 않으면 ValueError(오타 확인용).
-
-    deadline_day를 주면(order_fulfillment.csv의 deadline_day, ASAP 주문이라
-    None/NaN이면 생략) scheduling/report.py의 plot_gantt와 같은 방식으로
-    그 날짜 끝에 빨간 점선을 그어 마감 시점을 표시한다."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+def _draw_order_panel(ax, schedule: pd.DataFrame, order_id: str, deadline_day: float | None = None):
+    """schedule에서 order_id가 한 번이라도 등장하는 라인만 골라 ax 위에
+    행=라인/열=시간슬롯 그리드를 그린다. plot_order와 plot_order_comparison이
+    공유하는 핵심 로직 - fig 생성/범례 배치/저장은 호출부 책임이다.
+    반환값: (relevant_lines, legend_items). order_id가 아예 등장하지
+    않으면 ValueError(오타 확인용)."""
     import numpy as np
     from matplotlib.colors import BoundaryNorm, ListedColormap
     from matplotlib.patches import Patch
-
-    plt.rcParams["font.family"] = "Malgun Gothic"
-    plt.rcParams["axes.unicode_minus"] = False
 
     relevant_lines = sorted(schedule.loc[schedule["order_id"] == order_id, "line_id"].unique())
     if not relevant_lines:
@@ -109,9 +95,6 @@ def plot_order(
         else:
             grid[r, c] = 2 if row.activity == "setup" else 1
 
-    fig_w = max(12, T / 25)
-    fig_h = max(3, 0.5 * len(relevant_lines) + 1.5)
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.imshow(grid, aspect="auto", cmap=cmap, norm=norm, interpolation="none")
 
     for d in range(len(days) + 1):
@@ -122,7 +105,6 @@ def plot_order(
     ax.set_xticklabels([f"{days[i]}일" for i in tick_idx])
     ax.set_yticks(range(len(relevant_lines)))
     ax.set_yticklabels(relevant_lines)
-    ax.set_title(f"주문 [{order_id}] 생산 스케줄 (행: 라인, 열: 시간슬롯)")
 
     has_deadline = deadline_day is not None and not pd.isna(deadline_day) and int(deadline_day) in day_index
     if has_deadline:
@@ -142,12 +124,92 @@ def plot_order(
     if has_deadline:
         from matplotlib.lines import Line2D
         legend_items.append(Line2D([0], [0], color="red", linestyle="--", linewidth=1.5, label="마감일"))
+    return relevant_lines, legend_items
+
+
+def plot_order(
+    schedule: pd.DataFrame,
+    order_id: str,
+    out_path: str,
+    deadline_day: float | None = None,
+) -> int:
+    """schedule(line_schedule.csv를 그대로 읽은 DataFrame)에서 order_id가
+    한 번이라도 등장하는 라인만 골라, 계획기간 전체를 행=라인/열=시간슬롯
+    그리드로 그려 out_path에 저장한다. 반환값은 표시된 라인 개수.
+    order_id가 아예 등장하지 않으면 ValueError(오타 확인용).
+
+    deadline_day를 주면(order_fulfillment.csv의 deadline_day, ASAP 주문이라
+    None/NaN이면 생략) scheduling/report.py의 plot_gantt와 같은 방식으로
+    그 날짜 끝에 빨간 점선을 그어 마감 시점을 표시한다."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.rcParams["font.family"] = "Malgun Gothic"
+    plt.rcParams["axes.unicode_minus"] = False
+
+    days = sorted(schedule["day"].unique())
+    T = len(days) * len(SLOT_LABELS)
+    n_lines = schedule.loc[schedule["order_id"] == order_id, "line_id"].nunique()
+
+    fig_w = max(12, T / 25)
+    fig_h = max(3, 0.5 * n_lines + 1.5)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    relevant_lines, legend_items = _draw_order_panel(ax, schedule, order_id, deadline_day)
+    ax.set_title(f"주문 [{order_id}] 생산 스케줄 (행: 라인, 열: 시간슬롯)")
     ax.legend(handles=legend_items, bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     return len(relevant_lines)
+
+
+def plot_order_comparison(
+    before_schedule: pd.DataFrame,
+    after_schedule: pd.DataFrame,
+    order_id: str,
+    out_path: str,
+    before_deadline_day: float | None = None,
+    after_deadline_day: float | None = None,
+    before_label: str = "변경 전",
+    after_label: str = "변경 후",
+) -> None:
+    """같은 order_id에 대해 변경 전/후 스케줄을 위아래로 나란히 그려서
+    하나의 PNG로 저장한다(각 패널은 plot_order와 같은 그림, _draw_order_panel
+    공유). 두 스케줄에서 이 주문이 쓰는 물리 라인 집합이 다를 수 있어서
+    (재배정 결과 다른 라인으로 갈 수도 있으므로) 각 패널의 세로 크기를
+    각자의 라인 수에 비례하게 따로 잡는다."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.rcParams["font.family"] = "Malgun Gothic"
+    plt.rcParams["axes.unicode_minus"] = False
+
+    days = sorted(set(before_schedule["day"].unique()) | set(after_schedule["day"].unique()))
+    T = len(days) * len(SLOT_LABELS)
+    n_before = before_schedule.loc[before_schedule["order_id"] == order_id, "line_id"].nunique()
+    n_after = after_schedule.loc[after_schedule["order_id"] == order_id, "line_id"].nunique()
+
+    fig_w = max(12, T / 25)
+    fig_h_before = max(2.2, 0.5 * n_before + 1.3)
+    fig_h_after = max(2.2, 0.5 * n_after + 1.3)
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(fig_w, fig_h_before + fig_h_after),
+        gridspec_kw={"height_ratios": [max(n_before, 1), max(n_after, 1)]},
+    )
+
+    _relevant1, legend_items = _draw_order_panel(ax1, before_schedule, order_id, before_deadline_day)
+    ax1.set_title(f"[{before_label}] 주문 [{order_id}] 생산 스케줄 (행: 라인, 열: 시간슬롯)")
+
+    _relevant2, _legend2 = _draw_order_panel(ax2, after_schedule, order_id, after_deadline_day)
+    ax2.set_title(f"[{after_label}] 주문 [{order_id}] 생산 스케줄 (행: 라인, 열: 시간슬롯)")
+    ax2.legend(handles=legend_items, bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 def _resolve_order_ids(order_id_arg: str | None, schedule: pd.DataFrame, fulfillment: pd.DataFrame | None) -> list[str]:

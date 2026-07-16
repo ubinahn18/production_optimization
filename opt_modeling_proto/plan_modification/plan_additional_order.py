@@ -82,6 +82,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 import pandas as pd
 from ortools.sat.python import cp_model
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # opt_modeling_proto/ 를 import 경로에 추가
 import plan_from_orders as pfo
 from scheduling.models import MONEY_SCALE, OVERTIME_LOCAL_SLOTS, SLOT_LABELS, SLOTS_PER_DAY
 from scheduling.pooling import build_line_pools
@@ -92,21 +93,21 @@ from scheduling.pooling import build_line_pools
 # plan_from_orders.py의 CATEGORY_LINE_SPECS와 같은 형식으로, 이 주문을
 # 만들 수 있는 라인타입마다 시간당 생산량/필요인원을 적는다.
 # ======================================================================
-NEW_ORDER_ID = "PLACEHOLDER_ORDER_ID"
+NEW_ORDER_ID = "SOZ20251200010"
 NEW_ORDER_PRODUCT_ID = "PLACEHOLDER_PRODUCT_ID"
 NEW_ORDER_PRODUCT_NAME = "PLACEHOLDER_PRODUCT_NAME"
 NEW_ORDER_VENDOR = "PLACEHOLDER_VENDOR"
 NEW_ORDER_CATEGORY = "PLACEHOLDER_CATEGORY"  # 참고/표시용. rate/workers는 라인타입 기준으로 아래 직접 채우므로 이 값 자체가 스케줄링에 쓰이진 않음.
-NEW_ORDER_QUANTITY = 80_000  # 필요 생산수량 - 직접 수정
-NEW_ORDER_DEADLINE_DATE: date | None = date(2026, 7, 18)  # 예: date(2026, 8, 10). None이면 ASAP(하드 마감 없음, backlog 비용으로만 처리).
-NEW_ORDER_EARLIEST_START_DATE: date | None = date(2026, 7, 15)  # 원료 등 때문에 이 날짜 전엔 생산 불가. None이면 제약 없음(즉시 가능).
+NEW_ORDER_QUANTITY = 95_000  # 필요 생산수량 - 직접 수정
+NEW_ORDER_DEADLINE_DATE: date | None = date(2026, 8, 1)  # 예: date(2026, 8, 10). None이면 ASAP(하드 마감 없음, backlog 비용으로만 처리).
+NEW_ORDER_EARLIEST_START_DATE: date | None = date(2026, 7, 29)  # 원료 등 때문에 이 날짜 전엔 생산 불가. None이면 제약 없음(즉시 가능).
 NEW_ORDER_RATE_BY_LINE_TYPE: dict[str, float] = {
-    "셀라인": 2220,
-    "단발": 1080
+    "10열기": 7800,
+    "로터리": 7800
 }
 NEW_ORDER_WORKERS_BY_LINE_TYPE: dict[str, int] = {
-    "셀라인": 8,
-    "단발": 6
+    "10열기": 11,
+    "로터리": 11
 }
 NEW_ORDER_BACKLOG_COST_PER_UNIT_PER_DAY: float | None = None  # ASAP일 때만 의미 있음. None이면 --backlog-cost 기본값 사용.
 
@@ -646,8 +647,11 @@ def main():
     parser.add_argument("--reference-date", default=None, help="기존 계획을 만들 때 쓴 기준일(YYYY-MM-DD, 생략하면 오늘) - plan_from_orders.py와 맞춰야 함")
     parser.add_argument("--adding-date", required=True, help="신규 수주가 들어온 날짜(YYYY-MM-DD) - 이 날짜부터 재배정 가능")
     parser.add_argument("--horizon-days", type=int, default=pfo.MAX_DEADLINE_DAY)
-    parser.add_argument("--dir", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "real_plan"),
-                         help="기존 line_schedule.csv 등이 있는 디렉터리")
+    parser.add_argument(
+        "--dir",
+        default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output", "real_plan"),
+        help="기존 line_schedule.csv 등이 있는 디렉터리",
+    )
     parser.add_argument("--out-dir", default=None, help="결과 저장 폴더 (기본: <dir>/plan_additional_order)")
     parser.add_argument("--daily-wage", type=float, default=120_000)
     parser.add_argument("--hourly-wage", type=float, default=None)
@@ -1125,14 +1129,52 @@ def write_outputs(
         print(f"  재배정된 ASAP {c.order_id}: 이 구간 생산 {prod:,.0f} / 남은필요 {c.remaining_qty:,.0f} "
               f"(부족분 {max(0, c.remaining_qty - prod):,.0f})")
 
-    old_daily = {}
+    # ---- 날짜별 고용인원/잔업인원/잔업시간/인건비 변화 ----
+    ot_local = list(OVERTIME_LOCAL_SLOTS)
+
+    def _daily_breakdown(day_slots: list[float]) -> dict:
+        ot17 = day_slots[ot_local[0]] if len(day_slots) > ot_local[0] else 0
+        ot18 = day_slots[ot_local[1]] if len(day_slots) > ot_local[1] else 0
+        return {
+            "workforce": max(day_slots) if day_slots else 0,
+            "overtime_17_18": ot17,
+            "overtime_18_19": ot18,
+            "overtime_hours": (1 if ot17 > 0 else 0) + (1 if ot18 > 0 else 0),
+        }
+
+    def _daily_cost(d: dict) -> float:
+        return d["workforce"] * daily_wage + (d["overtime_17_18"] + d["overtime_18_19"]) * hourly_wage * overtime_multiplier
+
+    old_daily = {
+        day: _daily_breakdown([baseline.get((day - 1) * SLOTS_PER_DAY + local, 0) for local in range(SLOTS_PER_DAY)])
+        for day in range(adding_day, args.horizon_days + 1)
+    }
+    new_daily = {
+        day: _daily_breakdown([demand_by_slot.get((day - 1) * SLOTS_PER_DAY + local, 0) for local in range(SLOTS_PER_DAY)])
+        for day in range(adding_day, args.horizon_days + 1)
+    }
+
+    print(f"\n=== 신규 주문 반영으로 영향받은 날짜별 인원/인건비 변화 ({adding_day}일차~{args.horizon_days}일차) ===")
+    any_changed = False
     for day in range(adding_day, args.horizon_days + 1):
-        day_slots = [baseline.get((day - 1) * SLOTS_PER_DAY + local, 0) for local in range(SLOTS_PER_DAY)]
-        old_daily[day] = max(day_slots) if day_slots else 0
-    new_daily = {r["day"]: r["workforce"] for r in workforce_rows}
-    old_cost = sum(old_daily[d] * daily_wage for d in old_daily)
-    new_cost = sum(new_daily[d] * daily_wage for d in new_daily)
-    print(f"\n인건비(정규 일급 기준, {adding_day}일차~{args.horizon_days}일차 구간): "
+        b, a = old_daily[day], new_daily[day]
+        if b == a:
+            continue
+        any_changed = True
+        cost_b, cost_a = _daily_cost(b), _daily_cost(a)
+        print(
+            f"  {day}일차: 고용인원 {b['workforce']:.0f} -> {a['workforce']:.0f}(+{a['workforce'] - b['workforce']:.0f}), "
+            f"잔업인원(17-18) {b['overtime_17_18']:.0f} -> {a['overtime_17_18']:.0f}, "
+            f"잔업인원(18-19) {b['overtime_18_19']:.0f} -> {a['overtime_18_19']:.0f}, "
+            f"잔업시간 {b['overtime_hours']}시간 -> {a['overtime_hours']}시간, "
+            f"인건비 {cost_b:,.0f} -> {cost_a:,.0f}(+{cost_a - cost_b:,.0f})"
+        )
+    if not any_changed:
+        print("  (인원/인건비에 변화가 없습니다)")
+
+    old_cost = sum(_daily_cost(old_daily[d]) for d in old_daily)
+    new_cost = sum(_daily_cost(new_daily[d]) for d in new_daily)
+    print(f"\n총 인건비(일급+잔업수당 포함, {adding_day}일차~{args.horizon_days}일차 구간): "
           f"기존 {old_cost:,.0f} -> 신규 {new_cost:,.0f} (증가분 {new_cost - old_cost:,.0f})")
 
     print(f"\n[저장 완료] {schedule_path}")
