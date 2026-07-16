@@ -140,6 +140,12 @@ def main():
     parser.add_argument("--order-id", required=True, help="계획에서 제외할 주문 order_id")
     parser.add_argument("--excel-path", default=pfo.DEFAULT_EXCEL_PATH, help="주문 라인타입별 투입인원을 다시 찾을 때 쓸 수주진행현황 엑셀 경로")
     parser.add_argument("--reference-date", default=None, help="기존 계획을 만들 때 쓴 기준일(YYYY-MM-DD, 생략하면 오늘) - plan_from_orders.py와 맞춰야 함")
+    parser.add_argument(
+        "--read-specs", choices=["category", "excel"], default="category",
+        help="라인별 rate/투입인원을 어디서 가져올지 - 기존 계획을 만들 때 plan_from_orders.py에 준 "
+             "--read-specs와 반드시 맞춰야 한다. category(기본): CATEGORY_LINE_SPECS. excel: 엑셀의 "
+             "제품별 라인별 컬럼(T-AH).",
+    )
     parser.add_argument("--horizon-days", type=int, default=pfo.MAX_DEADLINE_DAY)
     parser.add_argument(
         "--dir",
@@ -161,8 +167,11 @@ def main():
     if args.order_id not in set(schedule_df["order_id"].dropna().unique()):
         raise SystemExit(f"[오류] order_id={args.order_id!r}가 line_schedule.csv에 없습니다(오타를 확인하세요).")
 
-    raw_orders, _load_stats = pfo.load_orders_from_excel(args.excel_path, reference_date=reference_date)
-    orders, _filter_stats = pfo.filter_and_attach_rates(raw_orders)
+    read_specs_from_excel = args.read_specs == "excel"
+    raw_orders, _load_stats = pfo.load_orders_from_excel(
+        args.excel_path, reference_date=reference_date, read_specs_from_excel=read_specs_from_excel,
+    )
+    orders, _filter_stats = pfo.filter_and_attach_rates(raw_orders, read_specs_from_excel=read_specs_from_excel)
     order_by_id = {o.order_id: o for o in orders}
     if args.order_id not in order_by_id:
         print(

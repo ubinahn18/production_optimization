@@ -645,6 +645,12 @@ def main():
     parser = argparse.ArgumentParser(description="이미 짜둔 계획에 신규 수주 1건을 끼워넣기")
     parser.add_argument("--excel-path", default=pfo.DEFAULT_EXCEL_PATH, help="기존 계획을 만들 때 쓴 수주진행현황 엑셀 경로")
     parser.add_argument("--reference-date", default=None, help="기존 계획을 만들 때 쓴 기준일(YYYY-MM-DD, 생략하면 오늘) - plan_from_orders.py와 맞춰야 함")
+    parser.add_argument(
+        "--read-specs", choices=["category", "excel"], default="category",
+        help="라인별 rate/투입인원을 어디서 가져올지 - 기존 계획을 만들 때 plan_from_orders.py에 준 "
+             "--read-specs와 반드시 맞춰야 한다(안 맞으면 이미 스케줄에 있는 동결 주문들의 인원 수요를 "
+             "잘못 계산함). category(기본): CATEGORY_LINE_SPECS. excel: 엑셀의 제품별 라인별 컬럼(T-AH).",
+    )
     parser.add_argument("--adding-date", required=True, help="신규 수주가 들어온 날짜(YYYY-MM-DD) - 이 날짜부터 재배정 가능")
     parser.add_argument("--horizon-days", type=int, default=pfo.MAX_DEADLINE_DAY)
     parser.add_argument(
@@ -672,8 +678,11 @@ def main():
 
     print(f"[정보] 기준일={reference_date}, 신규 수주 반영일={adding_date}(day {adding_day}), 계획기간={args.horizon_days}일")
 
-    raw_orders, _load_stats = pfo.load_orders_from_excel(args.excel_path, reference_date=reference_date)
-    orders, _filter_stats = pfo.filter_and_attach_rates(raw_orders)
+    read_specs_from_excel = args.read_specs == "excel"
+    raw_orders, _load_stats = pfo.load_orders_from_excel(
+        args.excel_path, reference_date=reference_date, read_specs_from_excel=read_specs_from_excel,
+    )
+    orders, _filter_stats = pfo.filter_and_attach_rates(raw_orders, read_specs_from_excel=read_specs_from_excel)
     order_by_id = {o.order_id: o for o in orders}
 
     lines = pfo.build_lines()

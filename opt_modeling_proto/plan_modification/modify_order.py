@@ -96,6 +96,12 @@ def main():
     parser.add_argument("--earliest-start-date", default=None, help="새 earliest-start(YYYY-MM-DD) - 안 주면 원래 주문의 earliest-start 유지")
     parser.add_argument("--excel-path", default=pfo.DEFAULT_EXCEL_PATH, help="원래 주문의 호환 라인타입/rate/workers 등을 찾을 때 쓸 수주진행현황 엑셀 경로")
     parser.add_argument("--reference-date", default=None, help="기존 계획을 만들 때 쓴 기준일(YYYY-MM-DD, 생략하면 오늘) - plan_from_orders.py와 맞춰야 함")
+    parser.add_argument(
+        "--read-specs", choices=["category", "excel"], default="category",
+        help="라인별 rate/투입인원을 어디서 가져올지 - 기존 계획을 만들 때 plan_from_orders.py에 준 "
+             "--read-specs와 반드시 맞춰야 한다(안 맞으면 원래 주문에서 복사해오는 rate/workers 자체가 "
+             "틀어짐). category(기본): CATEGORY_LINE_SPECS. excel: 엑셀의 제품별 라인별 컬럼(T-AH).",
+    )
     parser.add_argument("--horizon-days", type=int, default=pfo.MAX_DEADLINE_DAY)
     parser.add_argument("--dir", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output", "real_plan"),
                          help="기존 line_schedule.csv 등이 있는 디렉터리")
@@ -112,8 +118,11 @@ def main():
     reference_date = date.fromisoformat(args.reference_date) if args.reference_date else date.today()
     hourly_wage = args.hourly_wage if args.hourly_wage is not None else args.daily_wage / 8.0
 
-    raw_orders, _load_stats = pfo.load_orders_from_excel(args.excel_path, reference_date=reference_date)
-    orders, _filter_stats = pfo.filter_and_attach_rates(raw_orders)
+    read_specs_from_excel = args.read_specs == "excel"
+    raw_orders, _load_stats = pfo.load_orders_from_excel(
+        args.excel_path, reference_date=reference_date, read_specs_from_excel=read_specs_from_excel,
+    )
+    orders, _filter_stats = pfo.filter_and_attach_rates(raw_orders, read_specs_from_excel=read_specs_from_excel)
     order_by_id = {o.order_id: o for o in orders}
     original = order_by_id.get(args.order_id)
     if original is None:
@@ -152,12 +161,21 @@ def main():
     out_dir = args.out_dir or os.path.join(args.dir, "modify_order")
     removed_stage_dir = os.path.join(out_dir, "_removed_stage")
 
+    # "변경 전" 스케줄은 반드시 1/2단계를 실행하기 전에 미리 읽어서
+    # 메모리에 담아둬야 한다 - --dir과 --out-dir을 같은 폴더로 줘서 그
+    # 자리에 덮어쓰는 방식으로 체이닝하면(예: 이미 한 번 수정한 결과
+    # 위에 또 수정), 2단계가 끝난 뒤에 다시 args.dir에서 읽으려고 하면
+    # 이미 out_dir(=args.dir)에 새 결과가 덮어써진 뒤라서 "변경 전"이
+    # 사실상 "변경 후"를 자기 자신과 비교하는 꼴이 된다.
+    before_schedule = pd.read_csv(os.path.join(args.dir, "line_schedule.csv"))
+
     # ---- 1단계: remove_order.py로 이 주문을 통째로 제거 ----
     sys.argv = [
         "remove_order.py",
         "--order-id", args.order_id,
         "--excel-path", args.excel_path,
         "--reference-date", reference_date.isoformat(),
+        "--read-specs", args.read_specs,
         "--horizon-days", str(args.horizon_days),
         "--dir", args.dir,
         "--out-dir", removed_stage_dir,
@@ -187,6 +205,7 @@ def main():
         "plan_additional_order.py",
         "--excel-path", args.excel_path,
         "--reference-date", reference_date.isoformat(),
+        "--read-specs", args.read_specs,
         "--adding-date", reference_date.isoformat(),  # 제거로 비워진 슬롯 전체를 재배정 대상으로 고려
         "--horizon-days", str(args.horizon_days),
         "--dir", removed_stage_dir,
@@ -218,7 +237,6 @@ def main():
         for pid in pool.line_ids:
             type_by_physical_line[pid] = line.line_type_id
 
-    before_schedule = pd.read_csv(os.path.join(args.dir, "line_schedule.csv"))
     after_schedule = pd.read_csv(os.path.join(out_dir, "line_schedule.csv"))
 
     demand_before = ro.compute_demand(before_schedule, order_by_id, type_by_physical_line, args.horizon_days)
