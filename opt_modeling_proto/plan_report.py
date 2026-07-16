@@ -184,6 +184,7 @@ def write_plan_report_excel(
         ("제품군/호환라인 없음 제외", filter_stats["excluded_category"]),
         (f"납기 {deadline_window_days}일 초과 제외", filter_stats["excluded_deadline"]),
         ("잔량 0 이하 제외(ramp 반영 후)", filter_stats["excluded_nonpositive_qty"]),
+        ("원료입고일이 납기보다 늦어서 제외", filter_stats["excluded_earliest_start_conflict"]),
     ]
     for label, count in exclusion_rows:
         put(row, 1, label)

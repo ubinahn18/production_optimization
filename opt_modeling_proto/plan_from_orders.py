@@ -186,16 +186,27 @@ def filter_and_attach_rates(
     0 이하가 되면 그 주문은 제외한다(excluded_nonpositive_qty).
 
     earliest_start_day(부자재/원료 입고일로 정해지는 최초 생산가능일)가
-    계획기간(MAX_DEADLINE_DAY)을 넘는 값이면 여기서 지워서(None) 제약을
-    걸지 않는다 - orders_from_excel.py는 계획기간 길이를 모르므로 값을
-    그대로(우리 horizon 밖일 수도 있는 채로) 넘겨주고, 실제 horizon
-    길이를 아는 이 함수에서 최종 판단한다."""
+    계획기간(MAX_DEADLINE_DAY)을 넘는 값이면 그 주문은 이번 계획기간
+    안에서는 물리적으로 생산 가능한 날이 하루도 없다는 뜻이므로 아예
+    제외한다(excluded_earliest_start_conflict) - deadline_day가 있든
+    없든(ASAP) 마찬가지다: deadline_day가 있는 주문은 이 시점에 이미 위
+    ramp 처리를 거쳐서 항상 <=MAX_DEADLINE_DAY로 정리돼 있으므로
+    earliest_start_day > MAX_DEADLINE_DAY는 곧 earliest_start_day >
+    deadline_day(원료가 도착하기도 전에 납기가 지나가버림)를 의미하고,
+    ASAP 주문은 애초에 이 계획기간 안에 만들 수 있는 날이 없다는
+    뜻이다. 제약을 그냥 지워서 "언제든 생산 가능"으로 숨기면 안 된다 -
+    실제로는 절대 불가능한 주문인데 가능한 것처럼 솔버에 거짓 정보를
+    주게 되어, 원료가 도착하기도 전에 생산하는 것으로 계획이 잡힐 수
+    있다. orders_from_excel.py는 계획기간 길이를 모르므로 값을 그대로
+    (우리 horizon 밖일 수도 있는 채로) 넘겨주고, 실제 horizon 길이를
+    아는 이 함수에서 최종 판단한다."""
     kept: list[Order] = []
     stats = {
         "total": len(orders),
         "excluded_category": 0,
         "excluded_deadline": 0,
         "excluded_nonpositive_qty": 0,
+        "excluded_earliest_start_conflict": 0,
         "included": 0,
     }
     for o in orders:
@@ -227,7 +238,12 @@ def filter_and_attach_rates(
                 continue
 
         if o.earliest_start_day is not None and o.earliest_start_day > MAX_DEADLINE_DAY:
-            o.earliest_start_day = None
+            # deadline_day가 있든(이 시점엔 항상 <=MAX_DEADLINE_DAY라서
+            # earliest_start_day가 그보다 늦다는 뜻) ASAP든(애초에 이
+            # 계획기간 안에 만들 수 있는 날이 하루도 없다는 뜻) 이번
+            # 계획기간에는 생산이 물리적으로 불가능하므로 제외한다.
+            stats["excluded_earliest_start_conflict"] += 1
+            continue
         if specs is not None:  # cellbio, 또는 category 방식 - excel 방식이면 이미 채워져 있어서 건드릴 필요 없음
             o.rate = {s["line_type_id"]: s["rate"] for s in specs}
             o.workers = {s["line_type_id"]: s["workers"] for s in specs}
@@ -322,7 +338,8 @@ def main():
         f"[정보] 엑셀 기반 주문 {stats['total']}건 -> "
         f"제품군/호환라인 없음으로 제외 {stats['excluded_category']}건, "
         f"납기 {MAX_DEADLINE_DAY + LATE_RAMP_DAYS}일 초과 제외 {stats['excluded_deadline']}건, "
-        f"ramp 반영 후 잔량0이하 제외 {stats['excluded_nonpositive_qty']}건 "
+        f"ramp 반영 후 잔량0이하 제외 {stats['excluded_nonpositive_qty']}건, "
+        f"최초 생산 가능일이 계획 기간보다 늦어서 제외 {stats['excluded_earliest_start_conflict']}건 "
         f"-> 최종 {stats['included']}건"
     )
     if not orders:

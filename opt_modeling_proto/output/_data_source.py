@@ -35,6 +35,12 @@ def add_source_args(parser) -> None:
     )
     parser.add_argument("--reference-date", default=None, help="--real-plan용 기준일(YYYY-MM-DD, 생략하면 오늘)")
     parser.add_argument("--excel-path", default=None, help="--real-plan용 수주진행현황 엑셀 경로(생략하면 기본 경로)")
+    parser.add_argument(
+        "--read-specs", choices=["category", "excel"], default="category",
+        help="--real-plan일 때 라인별 rate/투입인원을 어디서 가져올지 - 그 결과를 만들 때 "
+             "plan_from_orders.py에 준 --read-specs와 반드시 맞춰야 한다. category(기본): "
+             "CATEGORY_LINE_SPECS. excel: 엑셀의 제품별 라인별 컬럼(T-AH).",
+    )
 
 
 def resolve_source(args, script_dir: str) -> tuple[list[Line], list[Order], str]:
@@ -46,8 +52,11 @@ def resolve_source(args, script_dir: str) -> tuple[list[Line], list[Order], str]
 
         ref = date.fromisoformat(args.reference_date) if args.reference_date else None
         excel_path = args.excel_path or pfo.DEFAULT_EXCEL_PATH
-        raw_orders, _load_stats = pfo.load_orders_from_excel(excel_path, reference_date=ref, verbose=False)
-        orders, _stats = pfo.filter_and_attach_rates(raw_orders)
+        read_specs_from_excel = args.read_specs == "excel"
+        raw_orders, _load_stats = pfo.load_orders_from_excel(
+            excel_path, reference_date=ref, verbose=False, read_specs_from_excel=read_specs_from_excel,
+        )
+        orders, _stats = pfo.filter_and_attach_rates(raw_orders, read_specs_from_excel=read_specs_from_excel)
         lines = pfo.build_lines()
         default_dir = os.path.join(script_dir, "real_plan")
     elif args.data:
