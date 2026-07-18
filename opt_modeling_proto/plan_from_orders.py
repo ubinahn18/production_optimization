@@ -37,6 +37,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 
 from data_pipeline.orders_from_excel import load_orders_from_excel
+from order_feasibility import describe_failures
 from plan_report import write_plan_report_excel
 from scheduling.models import Line, Order, ScheduleConfig
 from scheduling.report import plot_gantt, print_report, save_outputs
@@ -160,46 +161,41 @@ def filter_and_attach_rates(
     """호환 라인이 없는 주문과 납기가 계획기간을 너무 벗어난 주문을
     걸러내고, 남은 주문에 rate/workers를 채워 넣는다.
 
-    rate/workers 출처는 read_specs_from_excel로 고른다(plan_from_orders.py의
-    --read-specs 플래그, 기본은 False=category 방식):
-      - False(category, 기존 방식): category가 CATEGORY_LINE_SPECS에 없는
-        주문(마스크/튜브/용기/셀바이오 예외가 아닌 벌크/파우치/샤쉐 등)을
-        제외하고, 남은 주문에 그 제품군의 rate/workers를 채운다
-        (orders_from_excel.py가 만드는 Order는 rate/workers가 항상 빈
-        dict라서 여기서 처음 채워짐).
-      - True(excel): orders_from_excel.py가 read_specs_from_excel=True로
-        이미 채워둔 제품별 rate/workers(엑셀의 라인별 rpm/시간당Capa/
-        동시투입인원 컬럼에서 읽은 값)를 그대로 쓴다 - 여기서는 다시
-        채우지 않고, 호환 라인이 하나도 없는(rate가 빈 dict인) 주문만
-        제외한다.
-    둘 중 어느 쪽이든, 셀바이오 예외(발주처가 CELLBIO_VENDOR이고 품명에
-    CELLBIO_PRODUCT_KEYWORD가 들어감)는 category/엑셀 컬럼과 무관하게
-    항상 "셀바이오_사각패드" spec(전용 라인 1대)을 배정한다 - 엑셀의
-    라인별 컬럼(T~AH)은 표준 5개 라인타입만 다루고 셀바이오 전용 라인은
-    거기 없기 때문.
+    단계별로 순서대로 적용된다:
 
-    납기 ramp: 납기가 EARLY_RAMP_DAYS(1~5일차)면 수량의 EARLY_RAMP_FRACTION만
-    반영하고(나머지는 지난 계획주기에 이미 생산했다고 가정), 납기가
-    MAX_DEADLINE_DAY를 넘어 LATE_RAMP_DAYS 이내(31~35일차)면 수량의
-    LATE_RAMP_FRACTION을 MAX_DEADLINE_DAY(30일차) 납기로 당겨서 반영한다.
-    그보다 더 먼 납기는 이번 계획에서 제외한다. ramp로 수량이 반올림되어
-    0 이하가 되면 그 주문은 제외한다(excluded_nonpositive_qty).
+    1) 호환 라인 spec 결정. read_specs_from_excel로 출처를 고른다(기본
+       False=category): False면 category가 CATEGORY_LINE_SPECS에 없는
+       주문(마스크/튜브/용기/셀바이오 예외가 아닌 벌크/파우치/샤쉐 등)을
+       제외하고 그 제품군의 rate/workers를 나중에 채워 넣는다. True면
+       orders_from_excel.py가 이미 채워둔 제품별 rate/workers를 그대로
+       쓰고, 호환 라인이 하나도 없는(rate가 빈 dict인) 주문만 제외한다.
+       어느 쪽이든 셀바이오 예외(발주처+품명 매칭)는 무조건 전용
+       "셀바이오_사각패드" spec을 쓴다(엑셀 컬럼엔 그 라인이 없어서).
 
-    earliest_start_day(부자재/원료 입고일로 정해지는 최초 생산가능일)가
-    계획기간(MAX_DEADLINE_DAY)을 넘는 값이면 그 주문은 이번 계획기간
-    안에서는 물리적으로 생산 가능한 날이 하루도 없다는 뜻이므로 아예
-    제외한다(excluded_earliest_start_conflict) - deadline_day가 있든
-    없든(ASAP) 마찬가지다: deadline_day가 있는 주문은 이 시점에 이미 위
-    ramp 처리를 거쳐서 항상 <=MAX_DEADLINE_DAY로 정리돼 있으므로
-    earliest_start_day > MAX_DEADLINE_DAY는 곧 earliest_start_day >
-    deadline_day(원료가 도착하기도 전에 납기가 지나가버림)를 의미하고,
-    ASAP 주문은 애초에 이 계획기간 안에 만들 수 있는 날이 없다는
-    뜻이다. 제약을 그냥 지워서 "언제든 생산 가능"으로 숨기면 안 된다 -
-    실제로는 절대 불가능한 주문인데 가능한 것처럼 솔버에 거짓 정보를
-    주게 되어, 원료가 도착하기도 전에 생산하는 것으로 계획이 잡힐 수
-    있다. orders_from_excel.py는 계획기간 길이를 모르므로 값을 그대로
-    (우리 horizon 밖일 수도 있는 채로) 넘겨주고, 실제 horizon 길이를
-    아는 이 함수에서 최종 판단한다."""
+    2) 납기 ramp(deadline_day가 있는 주문만): 원래 납기가
+       MAX_DEADLINE_DAY + LATE_RAMP_DAYS(35일)를 넘으면 이번 계획에서
+       제외(excluded_deadline, 다음 계획주기에 다시 판단). 1~5일차면
+       수량의 EARLY_RAMP_FRACTION만 반영(나머지는 지난 주기에 이미
+       생산했다고 가정). 31~35일차면 수량의 LATE_RAMP_FRACTION만
+       MAX_DEADLINE_DAY(30일차)로 당겨서 반영(나머지 20%는 다음
+       계획주기의 "1~5일차" 구간에서 마저 반영됨). ramp로 수량이
+       0 이하가 되면 제외(excluded_nonpositive_qty).
+
+    3) earliest_start_day(부자재/원료 입고일 기준 최초 생산가능일)가
+       계획기간(MAX_DEADLINE_DAY)을 넘으면 제외한다
+       (excluded_earliest_start_conflict) - deadline_day가 있든(2)에서
+       이미 <=MAX_DEADLINE_DAY로 정리됐으므로 이 경우 항상
+       earliest_start_day > deadline_day, 즉 원료가 도착하기도 전에
+       납기가 지나가버림) 없든(ASAP - 이 계획기간 안에 만들 수 있는
+       날이 아예 없음) 마찬가지로 물리적으로 불가능하다. orders_from_
+       excel.py는 계획기간 길이를 모르므로 이 값을 그대로(horizon 밖일
+       수도 있는 채로) 넘겨주고, 실제 길이를 아는 여기서 최종 판단한다.
+
+    이 함수가 다루는 건 "언제 생산 가능한가"(날짜 창)뿐이고, "그 창
+    안에서 실제로 라인 용량이 충분한가"(order_feasibility.py의
+    [1]/[2]/[3] 체크)는 여기서 안 본다 - 그건 main()이 lines/closed_days를
+    다 구한 뒤에 따로 적용한다(라인 대수/휴무일 정보가 이 함수에는 아직
+    없어서)."""
     kept: list[Order] = []
     stats = {
         "total": len(orders),
@@ -210,6 +206,8 @@ def filter_and_attach_rates(
         "included": 0,
     }
     for o in orders:
+        raw_deadline_day = o.deadline_day  # ramp로 바뀌기 전 원본 - 아래 로그에서 "원래 납기"로 보여줄 때 씀
+
         is_cellbio = o.vendor.strip() == CELLBIO_VENDOR and CELLBIO_PRODUCT_KEYWORD in o.product_name
         if is_cellbio:
             specs = CATEGORY_LINE_SPECS["셀바이오_사각패드"]
@@ -238,11 +236,13 @@ def filter_and_attach_rates(
                 continue
 
         if o.earliest_start_day is not None and o.earliest_start_day > MAX_DEADLINE_DAY:
-            # deadline_day가 있든(이 시점엔 항상 <=MAX_DEADLINE_DAY라서
-            # earliest_start_day가 그보다 늦다는 뜻) ASAP든(애초에 이
-            # 계획기간 안에 만들 수 있는 날이 하루도 없다는 뜻) 이번
-            # 계획기간에는 생산이 물리적으로 불가능하므로 제외한다.
             stats["excluded_earliest_start_conflict"] += 1
+            deadline_desc = f"원래 납기 {raw_deadline_day}일차" if raw_deadline_day is not None else "ASAP"
+            print(
+                f"[정보] {o.order_id}: 최초 생산가능일(day {o.earliest_start_day})이 계획기간"
+                f"({MAX_DEADLINE_DAY}일)을 넘어 물리적으로 생산 불가능 - 이번 계획에서 제외합니다"
+                f"({deadline_desc})"
+            )
             continue
         if specs is not None:  # cellbio, 또는 category 방식 - excel 방식이면 이미 채워져 있어서 건드릴 필요 없음
             o.rate = {s["line_type_id"]: s["rate"] for s in specs}
@@ -250,6 +250,69 @@ def filter_and_attach_rates(
         kept.append(o)
     stats["included"] = len(kept)
     return kept, stats
+
+
+def enforce_feasibility(
+    orders: list[Order],
+    raw_deadline_by_id: dict[str, int | None],
+    count_by_type: dict[str, int],
+    closed_days: frozenset[int],
+    horizon_days: int,
+) -> tuple[list[Order], int]:
+    """order_feasibility.describe_failures()로 [1]/[2]/[3](역전/구간
+    전부 휴무일/라인 capa 부족) 중 하나라도 걸리는 주문을 찾아서, 둘 중
+    하나로 처리한다:
+
+    - 원래(ramp 전) 납기가 MAX_DEADLINE_DAY를 넘었던(31~35일차, late-ramp
+      대상) 주문: 다음 계획주기로 미루면 되는 주문이므로 이번 계획에서
+      조용히 제외하고 안내만 출력한다.
+    - 그 외(원래 납기가 이번 계획기간 안이었던 - 이미 확정된 - 주문,
+      또는 ASAP): "다음 주기로 미루면 그만"인 문제가 아니라 원료/부자재
+      입고일이나 납기 데이터 자체를 조정해야 하는 문제다. 이런 주문을
+      조용히 넘기면 CP-SAT이 한참 탐색한 뒤에야(또는 time-limit을
+      다 채우고서야) INFEASIBLE로 끝나버리므로, 그렇게 두지 않고 여기서
+      바로 프로그램을 종료한다 - 다만 한 건 걸리자마자 바로 종료하면
+      사람이 하나 고치고 다시 돌렸다가 또 다음 한 건에서 걸리는 걸
+      반복하게 되므로, 이 주문들을 전부 다 찾은 다음에 한꺼번에 알려주고
+      나서 종료한다.
+
+    (필터링된 주문 목록, 다음 계획주기로 미뤄져서 제외된 건수)를
+    반환한다 - 후자는 plan_report.py의 "주문 필터링 요약" 표에 그대로
+    보여준다(자세한 사유는 위 안내 출력에 이미 나오므로 표에는 건수만)."""
+    failures_by_id = describe_failures(orders, count_by_type, closed_days, horizon_days)
+    if not failures_by_id:
+        return orders, 0
+
+    kept: list[Order] = []
+    blocking: list[tuple[Order, str]] = []
+    deferred_count = 0
+    for o in orders:
+        failures = failures_by_id.get(o.order_id)
+        if not failures:
+            kept.append(o)
+            continue
+
+        detail = "; ".join(failures)
+        raw_deadline = raw_deadline_by_id.get(o.order_id)
+        is_late_ramped = raw_deadline is not None and raw_deadline > MAX_DEADLINE_DAY
+        if is_late_ramped:
+            print(
+                f"[정보] {o.order_id}: {detail} - 원래 납기가 {raw_deadline}일차(계획기간 초과, ramp 대상)라 "
+                f"이번 계획에서 제외하고 다음 계획주기로 미룹니다."
+            )
+            deferred_count += 1
+            continue
+
+        blocking.append((o, detail))
+
+    if blocking:
+        for o, detail in blocking:
+            print(f"[오류] {o.order_id}가 물리적으로 실행 불가능한 조건에 걸립니다: {detail}")
+        raise SystemExit(
+            f"[오류] 위 {len(blocking)}건은 이번 계획기간 안에 확정된 납기라 건너뛸 수 없습니다 - "
+            f"원료/부자재 입고예정일 또는 납기 데이터를 확인해서 조정한 뒤 다시 실행하세요."
+        )
+    return kept, deferred_count
 
 
 def resolve_closed_days(
@@ -276,6 +339,33 @@ def resolve_closed_days(
     if out_of_range:
         print(f"[경고] 계획기간({reference_date} ~ {reference_date + timedelta(days=horizon_days - 1)}) 밖 휴무일 무시: {out_of_range}")
     return frozenset(result)
+
+
+def _check_output_writable(output_dir: str, filenames: list[str]) -> None:
+    """CP-SAT 풀이(길면 몇십 분)까지 다 끝난 뒤에야 결과 저장 단계에서
+    "파일이 열려 있어서 저장 실패"를 만나면 그동안의 계산이 통째로
+    낭비된다 - 그러니 계산을 시작하기도 전에, 이번 실행이 실제로 쓸
+    출력 파일들이 이미 다른 프로그램(엑셀 등)에서 열려서 잠겨 있는지
+    먼저 확인하고, 잠겨 있으면 바로 종료한다(파일에 실제로 쓰지는
+    않고 append 모드로 열어보기만 해서 잠금 여부만 확인)."""
+    locked = []
+    for name in filenames:
+        path = os.path.join(output_dir, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "a"):
+                pass
+        except PermissionError:
+            locked.append(path)
+    if locked:
+        locked_list = "\n".join(f"  - {p}" for p in locked)
+        raise SystemExit(
+            f"[오류] 다음 출력 파일이 이미 다른 프로그램(엑셀 등)에서 열려 있어 저장할 수 없습니다:\n"
+            f"{locked_list}\n"
+            f"[오류] 파일을 닫고 다시 실행하세요 - 계산을 다 마친 뒤에야 저장 실패를 발견하면 "
+            f"그동안의 계산이 낭비되므로 시작 전에 미리 확인합니다."
+        )
 
 
 def main():
@@ -326,11 +416,25 @@ def main():
     )
     args = parser.parse_args()
 
+    output_filenames = [
+        "line_schedule.csv", "line_schedule_compressed.csv",
+        "daily_workforce.csv", "order_fulfillment.csv",
+    ]
+    if not args.no_plot:
+        output_filenames.append("gantt_overview.png")
+    if not args.no_excel_report:
+        output_filenames.append("plan_report.xlsx")
+    _check_output_writable(args.output_dir, output_filenames)
+
     reference_date = date.fromisoformat(args.reference_date) if args.reference_date else date.today()
     read_specs_from_excel = args.read_specs == "excel"
     raw_orders, load_stats = load_orders_from_excel(
         args.excel_path, reference_date=reference_date, read_specs_from_excel=read_specs_from_excel,
     )
+    # filter_and_attach_rates()가 deadline_day를 ramp로 덮어쓰기 전에
+    # 원본을 스냅샷해둔다 - enforce_feasibility()가 "이 주문이 원래
+    # 이번 계획기간 안이었는지(late-ramp 대상이 아닌지)"를 판단할 때 씀.
+    raw_deadline_by_id = {o.order_id: o.deadline_day for o in raw_orders}
 
     orders, stats = filter_and_attach_rates(raw_orders, read_specs_from_excel=read_specs_from_excel)
     print(f"[정보] rate/투입인원 출처: {args.read_specs}")
@@ -354,6 +458,13 @@ def main():
         reference_date, args.horizon_days, closed_dates,
         close_weekends=not args.no_weekend_closure,
     )
+
+    count_by_type = {l.line_type_id: l.count for l in lines}
+    orders, deferred_count = enforce_feasibility(orders, raw_deadline_by_id, count_by_type, closed_days, args.horizon_days)
+    stats["excluded_feasibility_deferred"] = deferred_count
+    if not orders:
+        print("[정보] feasibility 체크로 모든 주문이 제외되어 스케줄링할 주문이 없습니다. 종료.")
+        return
 
     config = ScheduleConfig(
         horizon_days=args.horizon_days,

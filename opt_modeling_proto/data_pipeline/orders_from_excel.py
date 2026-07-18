@@ -47,22 +47,30 @@ HEADER_ROW = 5
 DATA_START_ROW = 6
 
 # 엑셀상 납기 그대로가 아니라 이만큼 앞당긴 날짜를 프로그램상 마감일로
-# 쓴다 - 실제로는 납기 당일이 아니라 그보다 PRODUCTION_LEAD_DAYS일 먼저
-# 생산을 끝내둬야 미생물 검사가 가능하기 때문. 앞당긴 결과가
-# 1일차(기준일 당일)보다 이르게 나오면(=엑셀 납기가 이미 코앞이라 여유가
-# 5일도 안 남음) 1일차로 clamp한다 - 0/음수 day는 스케줄러가 다루는
-# day index 체계(1-indexed)에 없는 값이라 그대로 넘기면 에러가 난다.
-PRODUCTION_LEAD_DAYS = 5
+# 쓴다 - 실제로는 납기 당일이 아니라 그보다 며칠 먼저 생산을 끝내둬야
+# 완제품검사가 가능하기 때문. '완제품검사' 열이 'y'인 제품은 검사가
+# 하루면 끝나므로 PRODUCTION_LEAD_DAYS_INSPECTED, 아니면 기존처럼
+# PRODUCTION_LEAD_DAYS_DEFAULT를 쓴다(제품별로 다름 - 아래 루프에서
+# 매 행마다 고른다). 앞당긴 결과가 1일차(기준일 당일)보다 이르게
+# 나오면(=엑셀 납기가 이미 코앞이라 여유가 그만큼도 안 남음) 1일차로
+# clamp한다 - 0/음수 day는 스케줄러가 다루는 day index 체계(1-indexed)에
+# 없는 값이라 그대로 넘기면 에러가 난다.
+PRODUCTION_LEAD_DAYS_DEFAULT = 6
+PRODUCTION_LEAD_DAYS_INSPECTED = 1
 
 # 부자재/원료 입고예정일에 더하는 여유일. 입고 당일 바로 생산 가능한 게
-# 아니라 부자재는 검수 등으로 +SUBMATERIAL_LEAD_DAYS일, 원료는 내용물 생산+미생물 검사 시간으로
-#  +RAW_MATERIAL_LEAD_DAYS일이 지나야 실제로 투입 가능하다는
-# 현장 기준. earliest_start_day는 "(부자재입고예정일 + SUBMATERIAL_LEAD_DAYS)
-# vs (원료입고예정일 + RAW_MATERIAL_LEAD_DAYS)" 중 더 늦은 날짜로 정한다
-# (입고일 자체를 그냥 비교하는 게 아님 - 각각 여유일을 더한 "실제 투입
-# 가능일"끼리 비교).
+# 아니라 부자재는 검수 등으로 +SUBMATERIAL_LEAD_DAYS일, 원료는 내용물
+# 생산+검사 시간으로 며칠이 지나야 실제로 투입 가능하다는 현장 기준.
+# '내용물검사' 열이 'y'인 제품은 검사가 하루면 끝나므로
+# RAW_MATERIAL_LEAD_DAYS_INSPECTED, 아니면 기존처럼
+# RAW_MATERIAL_LEAD_DAYS_DEFAULT를 쓴다(제품별로 다름 - 아래 루프에서
+# 매 행마다 고른다). earliest_start_day는 "(부자재입고예정일 +
+# SUBMATERIAL_LEAD_DAYS) vs (원료입고예정일 + 원료 lead days)" 중 더
+# 늦은 날짜로 정한다(입고일 자체를 그냥 비교하는 게 아님 - 각각 여유일을
+# 더한 "실제 투입 가능일"끼리 비교).
 SUBMATERIAL_LEAD_DAYS = 1
-RAW_MATERIAL_LEAD_DAYS = 7
+RAW_MATERIAL_LEAD_DAYS_DEFAULT = 7
+RAW_MATERIAL_LEAD_DAYS_INSPECTED = 1
 
 # 논리 필드 이름 -> 엑셀 헤더 텍스트(공백/줄바꿈 제거 후 비교, _normalize_header 참고).
 # 시트마다 실제 열 번호가 다르므로 이름으로 찾는다.
@@ -81,6 +89,8 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "submaterial_date": ["부자재입고예정일"],
     "raw_material_date": ["원료입고예정일"],
     "status": ["상태"],
+    "content_inspection": ["내용물검사"],
+    "finished_inspection": ["완제품검사"],
 }
 
 # 이미 끝났거나(생산/출고 완료) 더 이상 유효하지 않은(취소) 주문 상태.
@@ -262,6 +272,12 @@ def _extract_sheet_count(product_name: str) -> int | None:
     return total if total != 1 else None
 
 
+def _is_marked_yes(value) -> bool:
+    """'내용물검사'/'완제품검사' 열이 'y'로 체크돼 있는지 확인한다
+    (대소문자/앞뒤 공백 무시). 비어 있거나 다른 값이면 False."""
+    return value is not None and str(value).strip().lower() == "y"
+
+
 def _resolve_supply_date(value) -> date | None:
     """'부자재입고예정일'/'원료입고예정일' 열은 날짜값이 기본이지만,
     예전 '부자재' 통합 열처럼 "완료"/"확인중"/"재고사용"/"5/12~5/20"
@@ -290,18 +306,23 @@ def load_orders_from_excel(
     """수주진행현황 엑셀을 읽어서 필터링된 (Order 목록, 요약 통계 dict)를 반환한다.
 
     stats 키: scanned/excluded_status/excluded_deadline_passed/
-    excluded_deadline_unresolved/excluded_nonpositive_qty/included
+    excluded_deadline_unresolved/excluded_nonpositive_qty/
+    excluded_deadline_before_lead/included
     (plan_from_orders.py의 plan_report 엑셀에서 제외 사유별 개수를
     보여줄 때 씀 - filter_and_attach_rates의 2차 필터 stats와 합쳐서
     쓰인다).
 
     필터: (reference_date 기준 납기가 아직 안 지났음 OR 납기가 ASAP)
           AND (상태가 EXCLUDED_STATUSES에 없음)
+          AND (생산 lead time을 뺀 실제 생산 마감일이 1일차 이상)
 
     reference_date를 안 주면 오늘 날짜를 쓴다. Order.deadline_day는
     "reference_date를 1일차로 하는 스케줄링 horizon 안에서 며칠째인지"로
     변환해서 넣는다(reference_date 당일이 마감이면 deadline_day=1) -
     scheduling.models.Order.deadline_day의 정의(1-indexed) 그대로.
+    엑셀 납기 자체는 아직 안 지났더라도, 거기서 생산 lead time을 뺀
+    실제 생산 마감일이 1일차보다 이르면(=이미 물리적으로 시간이 없는
+    주문) 1일차로 눙쳐 넘기지 않고 아예 제외한다(excluded_deadline_before_lead).
 
     rate/workers: read_specs_from_excel=False(기본)면 이 시점엔 알 수
     없으므로 빈 dict로 두고, 호출하는 쪽(plan_from_orders.py의
@@ -319,20 +340,25 @@ def load_orders_from_excel(
     두되 category를 "마스크_멀티시트"로 바꿔서 별도 라인 스펙
     (plan_from_orders.py의 CATEGORY_LINE_SPECS)이 적용되게 한다.
 
-    deadline_day: 엑셀 납기 그대로가 아니라 PRODUCTION_LEAD_DAYS일 앞당긴
-    날짜를 쓴다(실제 출고를 위해 납기보다 며칠 먼저 생산을 끝내둬야
-    해서) - 앞당긴 값이 1보다 작아지면 1로 clamp한다.
+    deadline_day: 엑셀 납기 그대로가 아니라 며칠 앞당긴 날짜를 쓴다(실제
+    출고를 위해 납기보다 먼저 생산을 끝내둬야 완제품검사가 가능해서) -
+    앞당기는 일수는 '완제품검사' 열이 'y'면 PRODUCTION_LEAD_DAYS_INSPECTED,
+    아니면 PRODUCTION_LEAD_DAYS_DEFAULT(제품마다 다름). 앞당긴 값이
+    1보다 작아지면(=실제 생산 마감일이 이미 지남) 1로 clamp하지 않고
+    그 주문 자체를 제외한다(excluded_deadline_before_lead).
 
     earliest_start_day: '부자재입고예정일'/'원료입고예정일' 두 열 중 실제
     날짜 값이 있는 쪽을 각각 해석하고(텍스트는 자유 서식이 섞여 있어
-    무시함, _resolve_supply_date 참고), 각각에 여유일(SUBMATERIAL_LEAD_DAYS/
-    RAW_MATERIAL_LEAD_DAYS)을 더한 "실제 투입 가능일"을 구한 다음, 그
-    둘 중 더 늦은 날짜를 "이 주문의 생산이 가능해지는 첫날"로 넣는다
-    (입고예정일 자체를 그냥 비교하는 게 아니라 여유일을 더한 값끼리
-    비교 - 부자재/원료 둘 다 들어와야 생산을 시작할 수 있으므로).
-    reference_date 당일이면 곧바로 1일차부터 가능하므로 제약 없음과
-    동일 - None으로 둠. 계획기간(horizon) 초과 여부는 이 함수가 horizon
-    길이를 모르므로 여기서는 확인하지 않고, 호출하는 쪽(plan_from_orders.py의
+    무시함, _resolve_supply_date 참고), 각각에 여유일을 더한 "실제 투입
+    가능일"을 구한 다음, 그 둘 중 더 늦은 날짜를 "이 주문의 생산이
+    가능해지는 첫날"로 넣는다(입고예정일 자체를 그냥 비교하는 게 아니라
+    여유일을 더한 값끼리 비교 - 부자재/원료 둘 다 들어와야 생산을 시작할
+    수 있으므로). 부자재 쪽 여유일은 항상 SUBMATERIAL_LEAD_DAYS, 원료
+    쪽은 '내용물검사' 열이 'y'면 RAW_MATERIAL_LEAD_DAYS_INSPECTED, 아니면
+    RAW_MATERIAL_LEAD_DAYS_DEFAULT(제품마다 다름). reference_date
+    당일이면 곧바로 1일차부터 가능하므로 제약 없음과 동일 - None으로 둠.
+    계획기간(horizon) 초과 여부는 이 함수가 horizon 길이를 모르므로
+    여기서는 확인하지 않고, 호출하는 쪽(plan_from_orders.py의
     filter_and_attach_rates)에서 처리한다.
     """
     reference_date = reference_date or date.today()
@@ -361,6 +387,7 @@ def load_orders_from_excel(
         "excluded_deadline_passed": 0,
         "excluded_deadline_unresolved": 0,
         "excluded_nonpositive_qty": 0,
+        "excluded_deadline_before_lead": 0,
         "included": 0,
     }
     warnings: list[str] = []
@@ -448,17 +475,41 @@ def load_orders_from_excel(
             if sheet_multiplier != 1:
                 remaining_qty = remaining_qty * sheet_multiplier
 
-            # ---- deadline_day 계산 (엑셀 납기 - PRODUCTION_LEAD_DAYS일) ----
+            # ---- 제품별 lead days 결정 ('완제품검사'/'내용물검사' 열이 'y'면 단축) ----
+            is_finished_inspected = _is_marked_yes(cell("finished_inspection", r))
+            is_content_inspected = _is_marked_yes(cell("content_inspection", r))
+            production_lead_days = (
+                PRODUCTION_LEAD_DAYS_INSPECTED if is_finished_inspected else PRODUCTION_LEAD_DAYS_DEFAULT
+            )
+            raw_material_lead_days = (
+                RAW_MATERIAL_LEAD_DAYS_INSPECTED if is_content_inspected else RAW_MATERIAL_LEAD_DAYS_DEFAULT
+            )
+
+            # ---- deadline_day 계산 (엑셀 납기 - production_lead_days일) ----
+            # 엑셀 납기 자체는 아직 안 지났어도(위 "납기 필터"를 통과했어도),
+            # 완제품검사 등을 위해 며칠 앞당겨 생산을 끝내야 하는 실제
+            # 생산 마감일(=deadline_day)이 오늘(1일차)보다 이르게 나올 수
+            # 있다 - 즉 물리적으로 이미 늦은 주문. 예전에는 이 경우 그냥
+            # 1일차로 clamp해서 "오늘이 마감"인 것처럼 취급했지만, 그러면
+            # 실제로는 생산할 시간이 없는 주문이 마치 아직 여유가 있는
+            # 것처럼 보여서 문제였다 - clamp하지 않고 아예 제외한다.
             deadline_day: int | None
             if deadline.kind == "asap":
                 deadline_day = None
             else:
                 raw_deadline_day = (deadline.deadline_date - reference_date).days + 1
-                deadline_day = max(1, raw_deadline_day - PRODUCTION_LEAD_DAYS)
+                deadline_day = raw_deadline_day - production_lead_days
+                if deadline_day < 1:
+                    stats["excluded_deadline_before_lead"] += 1
+                    warnings.append(
+                        f"{row_ref}: 납기({deadline.deadline_date.isoformat()})에서 생산 lead time"
+                        f"({production_lead_days}일)을 빼면 이미 지났음(day {deadline_day}) - 제외"
+                    )
+                    continue
 
             # ---- earliest_start_day 계산 ----
             # 부자재/원료 둘 다 도착해야 생산을 시작할 수 있으므로, 각각
-            # 입고예정일에 여유일(SUBMATERIAL_LEAD_DAYS/RAW_MATERIAL_LEAD_DAYS)을
+            # 입고예정일에 여유일(SUBMATERIAL_LEAD_DAYS/raw_material_lead_days)을
             # 더한 "실제 투입 가능일"을 구한 뒤 그 중 더 늦은 날짜를 쓴다
             # (입고예정일 자체를 그냥 비교하는 게 아님).
             ready_dates = []
@@ -467,7 +518,7 @@ def load_orders_from_excel(
                 ready_dates.append(submaterial_date + timedelta(days=SUBMATERIAL_LEAD_DAYS))
             raw_material_date = _resolve_supply_date(cell("raw_material_date", r))
             if raw_material_date is not None:
-                ready_dates.append(raw_material_date + timedelta(days=RAW_MATERIAL_LEAD_DAYS))
+                ready_dates.append(raw_material_date + timedelta(days=raw_material_lead_days))
 
             earliest_start_day: int | None = None
             if ready_dates:
@@ -498,6 +549,11 @@ def load_orders_from_excel(
                     earliest_start_day=earliest_start_day,
                     rate=rate,
                     workers=workers,
+                    content_inspection=is_content_inspected,
+                    finished_inspection=is_finished_inspected,
+                    submaterial_date=submaterial_date,
+                    raw_material_date=raw_material_date,
+                    raw_deadline_date=deadline.deadline_date if deadline.kind == "date" else None,
                 )
             )
             stats["included"] += 1
@@ -507,7 +563,8 @@ def load_orders_from_excel(
         print(
             f"[정보] 스캔 {stats['scanned']}건 -> 포함 {stats['included']}건 "
             f"(제외: 완료/취소상태 {stats['excluded_status']}, 납기지남 {stats['excluded_deadline_passed']}, "
-            f"납기해석불가 {stats['excluded_deadline_unresolved']}, 잔량0이하 {stats['excluded_nonpositive_qty']})"
+            f"납기해석불가 {stats['excluded_deadline_unresolved']}, 잔량0이하 {stats['excluded_nonpositive_qty']}, "
+            f"생산lead time반영후납기지남 {stats['excluded_deadline_before_lead']})"
         )
         if warnings:
             print(f"[경고] {len(warnings)}건의 주의사항(수동 확인 권장):")

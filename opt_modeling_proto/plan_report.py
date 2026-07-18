@@ -63,9 +63,21 @@ def write_plan_report_excel(
          ramp/카테고리 필터 단계의 filter_stats를 합쳐서 보여줌 -
          "납기 해석 불가"/"납기 지남"은 load_stats, "납기 N일 초과"는
          filter_stats에서 옴, N=deadline_window_days)
-      2) 주문별 상세: 발주처/제품명/납기일/생산량/생산잔량/최초생산일/
-         생산완료일 (day index는 전부 reference_date 기준 실제 달력
-         날짜로 변환 - "15일차"보다 "2026-07-24"가 바로 읽기 쉬움).
+      2) 주문별 상세: 주문ID/발주처/제품명/내용물검사/완제품검사/
+         부자재입고/원료입고/최초충포장가능/충포장시작/충포장종료/납기/
+         raw납기/생산량/생산잔량/내용물제조가능기간 (day index는 전부
+         reference_date 기준 실제 달력 날짜로 변환 - "15일차"보다
+         "2026-07-24"가 바로 읽기 쉬움). 내용물검사/완제품검사는 그
+         제품이 해당 검사를 받는 경우에만 "y"로 표시(아니면 빈칸).
+         부자재입고/원료입고는 엑셀 원본 입고예정일 그대로(여유일 더하기
+         전). 최초충포장가능은 earliest_start_day, 충포장시작/충포장종료는
+         실제로 이 스케줄에서 그 주문을 처음/마지막으로 생산한 날, 납기는
+         프로그램상 마감일(생산 lead days 반영 후), raw납기는 엑셀에
+         적힌 원본 납기 그대로(생산 lead days 반영 전). 내용물제조가능
+         기간은 내용물검사 대상이 아닌 제품만 계산한다(검사 대상이면
+         원료입고 후 바로 미생물검사 없이 짧게 끝나므로 별도 제조기간을
+         보여줄 의미가 없어 빈칸) - (원료입고예정일+1)일부터
+         (충포장시작일-6)일까지.
          생산잔량은 ASAP 주문이 backlog를 못 채웠을 때만 0보다 크다
          (마감일 있는 주문은 하드 제약으로 항상 필요수량을 채우므로 0).
       3) 제품군별 총 생산량 + 마스크 환산 총 생산량(마스크+마스크_멀티시트+
@@ -180,11 +192,13 @@ def write_plan_report_excel(
         ("완료/취소 상태 제외", load_stats["excluded_status"]),
         ("납기 해석 불가 제외", load_stats["excluded_deadline_unresolved"]),
         ("납기 지남 제외", load_stats["excluded_deadline_passed"]),
+        ("생산 lead time 반영 후 납기 지남 제외", load_stats["excluded_deadline_before_lead"]),
         ("잔량 0 이하 제외(원본)", load_stats["excluded_nonpositive_qty"]),
         ("제품군/호환라인 없음 제외", filter_stats["excluded_category"]),
         (f"납기 {deadline_window_days}일 초과 제외", filter_stats["excluded_deadline"]),
         ("잔량 0 이하 제외(ramp 반영 후)", filter_stats["excluded_nonpositive_qty"]),
-        ("원료입고일이 납기보다 늦어서 제외", filter_stats["excluded_earliest_start_conflict"]),
+        ("최초 충포장 가능일이 계획 기간보다 늦어서 제외", filter_stats["excluded_earliest_start_conflict"]),
+        ("다음 계획 기수로 미룸", filter_stats["excluded_feasibility_deferred"]),
     ]
     for label, count in exclusion_rows:
         put(row, 1, label)
@@ -195,19 +209,38 @@ def write_plan_report_excel(
     row += 3
 
     # ---- 2) 주문별 상세 ----
-    row = section_title(row, "주문별 상세", span=8)
-    row = table_header(row, ["주문ID", "발주처", "제품명", "납기일", "생산량", "생산잔량", "최초생산일", "생산완료일"])
+    row = section_title(row, "주문별 상세", span=15)
+    row = table_header(row, [
+        "주문ID", "발주처", "제품명", "내용물검사", "완제품검사", "부자재입고", "원료입고",
+        "최초충포장가능", "충포장시작", "충포장종료", "납기", "raw납기", "생산량", "생산잔량",
+        "내용물제조가능기간",
+    ])
     for o in sorted(orders, key=lambda o: (o.deadline_day is None, o.deadline_day or 0)):
         f = result.order_fulfillment[o.order_id]
         backlog = f["final_backlog"] if f["final_backlog"] else 0
+        pack_start_date = day_to_date(first_produce_day.get(o.order_id))
+
+        content_period = ""
+        if not o.content_inspection and o.raw_material_date is not None and pack_start_date is not None:
+            content_start = o.raw_material_date + timedelta(days=1)
+            content_end = pack_start_date - timedelta(days=6)
+            content_period = f"{content_start.isoformat()} ~ {content_end.isoformat()}"
+
         put(row, 1, o.order_id)
         put(row, 2, o.vendor)
         put(row, 3, o.product_name or o.product_id)
-        put(row, 4, "ASAP" if o.deadline_day is None else day_to_date(o.deadline_day), number_format=DATE_FMT)
-        put(row, 5, f["produced"], number_format=NUM_FMT)
-        put(row, 6, backlog, number_format=NUM_FMT)
-        put(row, 7, day_to_date(first_produce_day.get(o.order_id)), number_format=DATE_FMT)
-        put(row, 8, day_to_date(f["completion_day"]), number_format=DATE_FMT)
+        put(row, 4, "y" if o.content_inspection else "")
+        put(row, 5, "y" if o.finished_inspection else "")
+        put(row, 6, o.submaterial_date, number_format=DATE_FMT)
+        put(row, 7, o.raw_material_date, number_format=DATE_FMT)
+        put(row, 8, day_to_date(o.earliest_start_day), number_format=DATE_FMT)
+        put(row, 9, pack_start_date, number_format=DATE_FMT)
+        put(row, 10, day_to_date(f["completion_day"]), number_format=DATE_FMT)
+        put(row, 11, "ASAP" if o.deadline_day is None else day_to_date(o.deadline_day), number_format=DATE_FMT)
+        put(row, 12, "ASAP" if o.raw_deadline_date is None else o.raw_deadline_date, number_format=DATE_FMT)
+        put(row, 13, f["produced"], number_format=NUM_FMT)
+        put(row, 14, backlog, number_format=NUM_FMT)
+        put(row, 15, content_period)
         row += 1
     row += 1
 
@@ -252,7 +285,9 @@ def write_plan_report_excel(
         row += 1
 
     # ---- 열 너비 ----
-    widths = [22, 16, 22, 12, 12, 12, 12, 12]
+    # "주문별 상세" 표(15열)가 가장 넓으므로 그 열 수에 맞춰준다 - 아래
+    # 섹션들(6열 이하)은 어차피 그보다 적게 쓰므로 문제 없음.
+    widths = [22, 16, 22, 10, 10, 12, 12, 14, 12, 12, 12, 12, 12, 12, 24]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 

@@ -11,6 +11,7 @@ scheduling/models.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 
 # ----------------------------------------------------------------------
 # 시간 구조 상수
@@ -95,6 +96,16 @@ class Order:
         # (전역 기본값 하나로 퉁치고, 필요한 주문만 여기서 개별 조정).
     rate: dict = field(default_factory=dict)     # {line_type_id: 시간당 생산수량}. 없거나 0이면 그 라인 타입에서 생산 불가.
     workers: dict = field(default_factory=dict)  # {line_type_id: 그 라인 타입에서 이 제품 생산/셋업에 필요한 인원}
+
+    # 아래는 전부 스케줄링 로직(CP-SAT)에서는 안 쓰고 plan_report.py의
+    # "주문별 상세" 리포트에 원본 근거를 그대로 보여주기 위해서만 들고
+    # 다니는 필드다(product_name/vendor와 같은 용도) - data_pipeline/
+    # orders_from_excel.py가 엑셀에서 읽은 값을 그대로 채워 넣는다.
+    content_inspection: bool = False   # '내용물검사' 열이 'y'인지
+    finished_inspection: bool = False  # '완제품검사' 열이 'y'인지
+    submaterial_date: date | None = None    # '부자재입고예정일' 원본 날짜(여유일 더하기 전)
+    raw_material_date: date | None = None   # '원료입고예정일' 원본 날짜(여유일 더하기 전)
+    raw_deadline_date: date | None = None   # 엑셀 납기 원본 날짜(생산 lead days 빼기 전). None이면 ASAP.
 
     def compatible_line_types(self) -> list[str]:
         return [type_id for type_id, r in self.rate.items() if r and r > 0]
