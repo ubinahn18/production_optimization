@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>일별 인원 배치</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="topbar-left">
+    <label for="daySelect">일차:</label>
+    <select id="daySelect"></select>
+    <button id="prevDayBtn" title="이전 일차">◀</button>
+    <button id="nextDayBtn" title="다음 일차">▶</button>
+  </div>
+  <div class="topbar-mid">
+    <span id="headcountInfo">-</span>
+  </div>
+  <div class="topbar-right">
+    <span id="saveStatus" class="save-status">-</span>
+    <button id="resetBtn" class="danger">이 날짜 초기화</button>
+  </div>
+</header>
+
+<main>
+  <section id="gridSection">
+    <div id="closedLinesStrip" style="display:none;"></div>
+    <div id="gridScroll">
+      <table id="grid"></table>
+      <svg id="flowOverlay">
+        <defs>
+          <marker id="flowArrowHead" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#d35400"></path>
+          </marker>
+        </defs>
+      </svg>
+    </div>
+  </section>
+
+  <aside id="sidebar">
+    <div class="panel">
+      <h3>슬롯 전환 편집</h3>
+      <div class="transitionNav">
+        <button id="prevTransBtn" title="이전 전환">◀</button>
+        <span id="transitionLabel">-</span>
+        <button id="nextTransBtn" title="다음 전환">▶</button>
+      </div>
+      <p class="hint">왼쪽(출발)을 클릭하고 오른쪽(도착)을 클릭하면 그대로 전체 이동으로 연결됩니다. 일부만 옮기려면 아래 "이동 배정" 목록에서 숫자를 줄이세요. 표 위의 화살표: <b>클릭</b>하면 화면에서 숨겨지고, <b>우클릭</b>하면 화면에 표시되는 숫자만 줄일 수 있습니다(둘 다 실제 배정은 안 바뀜).</p>
+      <button id="showAllArrowsBtn" type="button" class="linklike">숨긴 화살표 전부 다시 보이기</button>
+      <div class="transitionCols">
+        <div class="transitionCol">
+          <div class="transitionColTitle">출발 (이전 슬롯)</div>
+          <ul id="sourceList"></ul>
+        </div>
+        <div class="transitionCol">
+          <div class="transitionColTitle">도착 (다음 슬롯)</div>
+          <ul id="destList"></ul>
+        </div>
+      </div>
+      <div class="edgeListWrap">
+        <div class="transitionColTitle">이동 배정</div>
+        <ul id="edgeList"></ul>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>인원 추적</h3>
+      <p class="hint" id="trackingHint">"새 추적 시작"을 누른 뒤 화살표를 클릭하면 그 인원수만큼 추적이 시작됩니다. 트리에서 노드를 클릭해 "활성 노드"로 고른 뒤 다른 화살표를 클릭하면 그 지점에서 새 가지가 생깁니다.</p>
+      <button id="newTrackBtn" type="button" class="linklike">+ 새 추적 시작</button>
+      <div id="trackingList"></div>
+    </div>
+  </aside>
+</main>
+
+<div id="tooltip"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
