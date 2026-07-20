@@ -103,11 +103,19 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
     #   prod_nf[pool,t,oid]    : non-fresh이면서 oid로 셋업된 라인 중
     #                            이번 슬롯에 oid를 생산하는 대수
     #   pool_setup[pool,t,oid] : non-fresh 라인 중 이번 슬롯에 oid로
-    #                            전환하는 1시간 셋업을 하는 대수
+    #                            전환하는 셋업의 "1단계"(setup_hours==1인
+    #                            풀에서는 셋업 전체 그 자체)를 하는 대수
+    #   pool_setup2[pool,t,oid]: setup_hours==2인 풀에서만 쓰임 - 직전
+    #                            슬롯에 pool_setup(1단계)를 한 대수가
+    #                            그대로 이어지는 "2단계"를 하는 대수
+    #                            (pool_setup2[t,oid] == pool_setup[t-1,oid]
+    #                            로 하드 고정됨). setup_hours==1인 풀은
+    #                            이 변수 자체가 없음(항상 0으로 취급).
     #   n_fresh_var[pool,t]    : 이번 슬롯 "시작 시점"에 fresh인 대수
     #   n_cfg_nf[pool,t,oid]   : 이번 슬롯이 "끝난 시점"에 non-fresh이면서
-    #                            oid로 셋업되어 있는 대수(다음 슬롯의
-    #                            idle_nf_of/prod_nf "재고" 역할)
+    #                            oid로 셋업(1단계+2단계 포함)되어 있거나
+    #                            그 제품으로 대기/생산 중인 대수(다음
+    #                            슬롯의 idle_nf_of/prod_nf "재고" 역할)
     #   n_idle_pool[pool,t]    : 이번 슬롯에 이 그룹에서 대기 중인 총 대수
     #                            (2단계 연속성 목적함수에서 씀)
     #
@@ -115,12 +123,18 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
     # 총량 차이가 곧 그 순간의 실제(달성 가능한 최소) 전환 횟수와 정확히
     # 같다 - day-boundary(fresh 강제 리셋)에도 예외 없이 이 등식이
     # 성립함은 설계 검토 과정에서 증명됨.
+    #
+    # 셋업 시간(LinePool.setup_hours, scheduling/models.py 참고): 1이면
+    # 기존 그대로(pool_setup 한 슬롯 뒤 바로 생산), 2면 pool_setup(1단계)
+    # 다음 슬롯에 pool_setup2(2단계)가 하드로 강제되고, 그 다음 슬롯에야
+    # 생산이 강제된다. 실제로는 셀라인만 1이고 나머지 전 라인 타입이 2다.
     # ------------------------------------------------------------------
     idle_fresh: dict[tuple, cp_model.IntVar] = {}
     prod_fresh: dict[tuple, cp_model.IntVar] = {}
     idle_nf_of: dict[tuple, cp_model.IntVar] = {}
     prod_nf: dict[tuple, cp_model.IntVar] = {}
     pool_setup: dict[tuple, cp_model.IntVar] = {}
+    pool_setup2: dict[tuple, cp_model.IntVar] = {}
     n_fresh_var: dict[tuple, cp_model.IntVar] = {}
     n_cfg_nf: dict[tuple, cp_model.IntVar] = {}
     n_idle_pool: dict[tuple, cp_model.IntVar] = {}
@@ -150,6 +164,10 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
     for p in pools:
         pkey = tuple(p.line_ids)
         k = p.k
+        two_hour = (p.setup_hours == 2)
+        if p.setup_hours not in (1, 2):
+            raise ValueError(f"라인풀 {pkey[0]!r}의 setup_hours={p.setup_hours!r}는 지원되지 않습니다(1 또는 2만 가능).")
+
         for t in range(T):
             local = t % SLOTS_PER_DAY
             day_of_t = t // SLOTS_PER_DAY + 1  # 1-based, deadline_day와 동일한 축
@@ -173,34 +191,64 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
             prod_fresh_terms = []
             idle_nf_terms = []
             prod_nf_terms = []
-            setup_terms_t = []
+            setup_terms_t = []  # 이번 슬롯에 "셋업 중"(1단계+2단계 합쳐서)인 전체 대수 - non-fresh 총량 분해에 씀
 
             for oid in p.compat_order_ids:
                 pf = model.NewIntVar(0, k, f"prodFresh[{pkey[0]},{t},{oid}]")
                 inf = model.NewIntVar(0, k, f"idleNfOf[{pkey[0]},{t},{oid}]")
                 pnf = model.NewIntVar(0, k, f"prodNf[{pkey[0]},{t},{oid}]")
-                su = model.NewIntVar(0, k, f"poolSetup[{pkey[0]},{t},{oid}]")
+                su1 = model.NewIntVar(0, k, f"poolSetup[{pkey[0]},{t},{oid}]")
                 cfg = model.NewIntVar(0, k, f"nCfgNf[{pkey[0]},{t},{oid}]")
                 prod_fresh[pkey, t, oid] = pf
                 idle_nf_of[pkey, t, oid] = inf
                 prod_nf[pkey, t, oid] = pnf
-                pool_setup[pkey, t, oid] = su
+                pool_setup[pkey, t, oid] = su1
                 n_cfg_nf[pkey, t, oid] = cfg
-                all_bool_vars += [pf, inf, pnf, su, cfg]
+                all_bool_vars += [pf, inf, pnf, su1, cfg]
+
+                if two_hour:
+                    su2 = model.NewIntVar(0, k, f"poolSetup2[{pkey[0]},{t},{oid}]")
+                    pool_setup2[pkey, t, oid] = su2
+                    all_bool_vars.append(su2)
+                else:
+                    su2 = 0  # setup_hours==1 풀은 2단계 셋업 자체가 없음 - 아래 식들에서 상수 0으로 취급
 
                 prod_fresh_terms.append(pf)
                 idle_nf_terms.append(inf)
                 prod_nf_terms.append(pnf)
-                setup_terms_t.append(su)
+                setup_terms_t.append(su1)
+                if two_hour:
+                    setup_terms_t.append(su2)
 
                 prev_cfg = n_cfg_nf[pkey, t - 1, oid] if t > 0 else 0
                 # non-fresh 라인 중 oid로 남아있는(대기 또는 계속 생산) 대수는
-                # 직전 슬롯 끝에 oid로 설정돼 있던 대수를 넘을 수 없음.
-                model.Add(inf + pnf <= prev_cfg)
+                # 직전 슬롯 "끝에 곧바로 그 제품으로 쓸 수 있게 준비돼
+                # 있던" 대수를 넘을 수 없다. 주의: 여기서 쓰는 건 prev_cfg
+                # (su1까지 포함한 전체 "oid에 커밋된" 집계)가 아니라 그보다
+                # 좁은 prev_avail이어야 한다 - setup_hours==2 풀에서 su1은
+                # 다음 슬롯에 바로 대기/생산으로 쓸 수 있는 게 아니라
+                # 반드시 su2를 한 번 더 거쳐야 하므로("su1 -> su2 ->
+                # produce", 2슬롯 뒤에야 가용), su1이 prev_cfg에 끼어있다고
+                # 그걸 바로 다음 슬롯의 inf/pnf 상한으로 써버리면 CP-SAT이
+                # "이미 su1 중인 그 유닛이 동시에 다음 슬롯 idle/produce도
+                # 가능하다"는 물리적으로 불가능한(2026-07-20 실제로
+                # 발견된) 해를 낼 수 있다 - su2를 하는 중인 유닛만 그
+                # 다음 슬롯에 진짜로 produce 전환이 가능하므로, su2(또는
+                # setup_hours==1 풀의 su1, 거긴 1슬롯짜리라 원래 로직
+                # 그대로)만 포함시킨다.
+                if t == 0:
+                    prev_avail = 0
+                else:
+                    prev_avail_setup = pool_setup2[pkey, t - 1, oid] if two_hour else pool_setup[pkey, t - 1, oid]
+                    prev_avail = (
+                        idle_nf_of[pkey, t - 1, oid] + prod_nf[pkey, t - 1, oid]
+                        + prev_avail_setup + prod_fresh[pkey, t - 1, oid]
+                    )
+                model.Add(inf + pnf <= prev_avail)
                 # oid로 설정된 상태(끝 시점)의 정의: 이번 슬롯에 oid로 남아있거나
-                # (대기/생산), 이번 슬롯에 oid로 셋업했거나, fresh 상태에서
-                # 무료로 곧장 oid 생산을 시작한 경우.
-                model.Add(cfg == inf + pnf + su + pf)
+                # (대기/생산), 이번 슬롯에 oid로 셋업(1단계 또는 2단계) 중이거나,
+                # fresh 상태에서 무료로 곧장 oid 생산을 시작한 경우.
+                model.Add(cfg == inf + pnf + su1 + su2 + pf)
                 # 셋업 공급은 "oid로 이미 설정되지 않은 non-fresh 대수"로
                 # 제한(같은 제품으로 또 셋업하는 무의미한 self-loop 방지).
                 # 주의: 이 부등식은 prev_cfg(전날 끝 시점의 설정 상태)가
@@ -209,40 +257,69 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
                 # 일 때. 날짜가 바뀌는 시점(t>0, local==0)에는 nfr가
                 # k로 강제 리셋되어(day-boundary) k-nfr=0이 되는데, 이건
                 # prev_cfg(전날 끝의 설정 대수, 보통 >0)와 무관한 값이라
-                # k-nfr-prev_cfg가 음수가 되어 su의 하한(0)과 모순되는
+                # k-nfr-prev_cfg가 음수가 되어 su1의 하한(0)과 모순되는
                 # 가짜 INFEASIBLE을 만든다. day-boundary에서는 어차피
-                # 비-fresh 전체 인원 집계 등식(k-nfr=0)만으로 su=0이
+                # 비-fresh 전체 인원 집계 등식(k-nfr=0)만으로 su1=0이
                 # 이미 강제되므로 이 부등식은 그때는 걸 필요가 없다
                 # (실제로 걸면 안 된다 - 실제 버그로 확인됨).
                 if t == 0 or local != 0:
-                    model.Add(su <= k - nfr - prev_cfg)
+                    model.Add(su1 <= k - nfr - prev_cfg)
 
-                if local == SLOTS_PER_DAY - 1:
-                    model.Add(su == 0)
+                # 날짜 마지막 슬롯 제한: setup_hours==1은 마지막 슬롯 하루
+                # (거기서 시작하면 다음날로 생산이 넘어가버림), setup_hours==2는
+                # 마지막 "두" 슬롯 다 su1 시작을 금지해야 su1->su2->생산
+                # 사슬이 항상 같은 날 안에서 끝난다.
+                if two_hour:
+                    if local >= SLOTS_PER_DAY - 2:
+                        model.Add(su1 == 0)
+                else:
+                    if local == SLOTS_PER_DAY - 1:
+                        model.Add(su1 == 0)
+
                 if t > deadline_slot_by_order[oid]:
-                    model.Add(su == 0)
+                    model.Add(su1 == 0)
                     model.Add(pf == 0)
                     model.Add(pnf == 0)
+                    if two_hour:
+                        model.Add(su2 == 0)
                 if t < earliest_start_slot_by_order[oid]:
-                    model.Add(su == 0)
+                    model.Add(su1 == 0)
                     model.Add(pf == 0)
                     model.Add(pnf == 0)
+                    if two_hour:
+                        model.Add(su2 == 0)
                 if day_of_t in config.closed_days:
-                    model.Add(su == 0)
+                    model.Add(su1 == 0)
                     model.Add(pf == 0)
                     model.Add(pnf == 0)
+                    if two_hour:
+                        model.Add(su2 == 0)
 
             # fresh 라인 전체 = 이번 슬롯 대기 + 이번 슬롯에 뭔가로 생산 시작
             model.Add(fv + sum(prod_fresh_terms) == nfr)
-            # non-fresh 라인 전체 = 대기/생산/셋업 중 하나
+            # non-fresh 라인 전체 = 대기/생산/셋업(1+2단계) 중 하나
             model.Add(sum(idle_nf_terms) + sum(prod_nf_terms) + sum(setup_terms_t) == k - nfr)
             model.Add(idl == fv + sum(idle_nf_terms))
 
-        # 셋업 -> 다음 슬롯 반드시 그 제품 생산(하드 제약). t, t+1 양쪽
-        # 변수가 다 만들어진 뒤에 걸어야 하므로 별도 루프로 뺀다.
-        for t in range(T - 1):
+        # 전이 제약(t, t+1 양쪽 변수가 다 만들어진 뒤에 걸어야 하므로 별도
+        # 루프로 뺀다):
+        #   setup_hours==1: 셋업(su1) -> 다음 슬롯 반드시 그 제품 생산.
+        #   setup_hours==2: su1(t) -> su2(t+1) 하드 고정(1단계 다음 슬롯은
+        #     반드시 2단계), su2(t) -> 다음 슬롯 반드시 그 제품 생산(1시간
+        #     풀의 su1->생산과 정확히 같은 형태, su2가 su1 역할을 대신함).
+        if two_hour:
             for oid in p.compat_order_ids:
-                model.Add(prod_nf[pkey, t + 1, oid] >= pool_setup[pkey, t, oid])
+                # 계획기간 첫 슬롯엔 "직전에 진행 중이던 1단계"가 있을 수
+                # 없으므로 2단계도 0으로 시작한다.
+                model.Add(pool_setup2[pkey, 0, oid] == 0)
+            for t in range(T - 1):
+                for oid in p.compat_order_ids:
+                    model.Add(pool_setup2[pkey, t + 1, oid] == pool_setup[pkey, t, oid])
+                    model.Add(prod_nf[pkey, t + 1, oid] >= pool_setup2[pkey, t, oid])
+        else:
+            for t in range(T - 1):
+                for oid in p.compat_order_ids:
+                    model.Add(prod_nf[pkey, t + 1, oid] >= pool_setup[pkey, t, oid])
 
     # ------------------------------------------------------------------
     # 생산량 집계 + 마감일 내 수량 충족 제약.
@@ -274,7 +351,18 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
         eligible_slots = T if o.is_asap() else min(
             (o.deadline_day - 1) * SLOTS_PER_DAY + SLOTS_PER_DAY, T
         )
-        max_rate_sum = sum(int(round(o.rate[lid])) for lid in compat)
+        compat_pools = compat_pools_for(compat)
+        # 라인 "타입"별 rate 1개씩만 더하면(예: 셀라인+단발 rate를 그냥
+        # 더함) 그 타입의 물리 대수(예: 단발 19대)를 통째로 무시하게 된다
+        # - 2026-07-19 실제로 발견된 버그: 이러면 upper_bound가 진짜
+        # 가용량(order_feasibility.py의 check[3]는 count_by_type을 곱해서
+        # 정확히 계산함)보다 훨씬 작게 잡히고, quantity가 그 좁은
+        # upper_bound보다 크면 아래 pv의 상한이 upper_bound 대신 quantity로
+        # 잡혀서(즉 "quantity 이상"이 사실상 "정확히 quantity"로 좁아짐)
+        # 실제로는 충분히 생산 가능한데도 quantity가 그 라인들의 rate
+        # 조합(GCD)으로 정확히 안 맞아떨어지면 가짜 INFEASIBLE이 남을 수
+        # 있다. 반드시 풀(LinePool)의 k(물리 대수)를 곱해야 한다.
+        max_rate_sum = sum(int(round(p.rate[oid])) * p.k for p in compat_pools)
         upper_bound = max_rate_sum * eligible_slots + 1  # 이론상 최대 생산량(모든 호환라인이 마감일까지 이 제품만 생산) + 여유 1
 
         storage_rate = None
@@ -285,7 +373,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
 
         terms = []
         storage_terms = []
-        for p in compat_pools_for(compat):
+        for p in compat_pools:
             pkey = tuple(p.line_ids)
             rate_val = int(round(p.rate[oid]))
             if rate_val <= 0:
@@ -351,8 +439,11 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
         # 보장은 없으므로, 누적생산량 변수의 상한을 quantity가 아니라 '이론상
         # 30일 내내 이 제품만 만들었을 때의 최대치'로 넉넉하게 잡는다
         # (quantity로 좁게 잡으면 실제로 그보다 더 생산하는 해에서
-        # INFEASIBLE이 나버린다).
-        max_rate_sum = sum(int(round(o.rate[lid])) for lid in compat)
+        # INFEASIBLE이 나버린다). 위 produced_qty 섹션과 동일한 이유로
+        # 반드시 풀의 k(물리 대수)를 곱해야 한다 - 안 곱하면 이 "넉넉하게"가
+        # 실제로는 안 넉넉해서 정확히 이 버그를 스스로 재현하게 된다.
+        compat_pools = compat_pools_for(compat)
+        max_rate_sum = sum(int(round(p.rate[oid])) * p.k for p in compat_pools)
         cum_upper_bound = max(max_rate_sum * T + 1, o.quantity)
 
         # 날짜별 선형 목표 진도. d=horizon_days-1(마지막 날)에는 정확히
@@ -360,8 +451,6 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
         expected_cum = [
             int(round(o.quantity * (d + 1) / horizon_days)) for d in range(horizon_days)
         ]
-
-        compat_pools = compat_pools_for(compat)
 
         prev_cum_var = None
         for d in range(horizon_days):
@@ -478,6 +567,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
             "idle_nf_of": {k: solver.Value(v) for k, v in idle_nf_of.items()},
             "prod_nf": {k: solver.Value(v) for k, v in prod_nf.items()},
             "pool_setup": {k: solver.Value(v) for k, v in pool_setup.items()},
+            "pool_setup2": {k: solver.Value(v) for k, v in pool_setup2.items()},
             "n_idle_pool": {k: solver.Value(v) for k, v in n_idle_pool.items()},
         }
 
@@ -522,10 +612,15 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
     #     풀링된 유닛들은 완전히 상호교환 가능해서, 이 값이 곧 그 순간
     #     실제로 달성 가능한 최소 전환 횟수와 정확히 같다(day-boundary도
     #     예외 없이 동일한 식으로 처리된다).
-    #   - 셋업 횟수: pool_setup 변수를 전부 더한 값 = 전체 기간 동안
-    #     발생한 제품 전환(셋업) 총 횟수. 셋업(Y) 다음 슬롯은 항상 그
-    #     제품(Y) 생산으로 이어지도록 하드 제약을 걸어뒀기 때문에, 이
-    #     값은 정확히 '실제로 발생한 제품 전환 이벤트 수'와 같다. 다만
+    #   - 셋업 횟수: pool_setup(1단계) 변수를 전부 더한 값 = 전체 기간 동안
+    #     발생한 제품 전환(셋업) 총 횟수. setup_hours==2인 풀의 2단계
+    #     (pool_setup2)는 일부러 안 더한다 - pool_setup2[t+1,oid]는
+    #     pool_setup[t,oid]와 하드로 같은 값이라(같은 셋업 이벤트의
+    #     연속일 뿐), 둘 다 더하면 이벤트 하나를 두 번 세게 된다. 셋업(Y)
+    #     1단계 다음엔 항상 2단계, 그 다음엔 항상 그 제품(Y) 생산으로
+    #     이어지도록 하드 제약을 걸어뒀기 때문에, pool_setup 합계는
+    #     setup_hours와 무관하게 정확히 '실제로 발생한 제품 전환 이벤트
+    #     수'와 같다. 다만
     #     대기<->생산 전환처럼 셋업도 "생산 중이던 라인이 하던 일을
     #     멈추고, 다른 걸 준비해서, 다시 생산으로 돌아오는" 동일한
     #     성격의 사건이므로(대기가 '들어감+나옴' 2점인 것과 대칭적으로),
@@ -576,6 +671,11 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
         #   선호한다. 이건 순수 타이브레이크라 실행가능 해 집합이 전혀
         #   줄어들지 않고, 위에서 증명했듯 1·2단계 목적함수 값과 절대
         #   상충하지 않는다.
+        #
+        #   (2026-07-19: 이걸 독립된 3단계로 분리해봤는데, 실제 규모
+        #   문제에서 그 3단계 자체가 시간 안에 전혀 수렴을 못 해서
+        #   되돌림 - 2단계 안에 낮은 가중치로 얹어두는 지금 방식이 최소한
+        #   "약간이라도 개선"을 공짜로 얻을 확률이 더 높다.)
         # ------------------------------------------------------------------
         all_prod_fresh_terms = list(prod_fresh.values())
         tiebreak_scale = sum(p.k for p in pools) * T + 1 if pools else 1
@@ -657,6 +757,13 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
                 (t, oid): best_snapshot["pool_setup"][pkey, t, oid]
                 for t in range(T) for oid in p.compat_order_ids
             },
+            "setup2": (
+                {
+                    (t, oid): best_snapshot["pool_setup2"][pkey, t, oid]
+                    for t in range(T) for oid in p.compat_order_ids
+                }
+                if p.setup_hours == 2 else {}
+            ),
         }
         line_activity.update(
             reconstruct_physical_schedule(p, pool_snapshot, T, order_id_to_product)
@@ -671,12 +778,15 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
         # 도달했는지'(완료일)를 슬롯 단위로 다시 훑어서 계산한다.
         cumulative = 0
         completion_day = None
+        first_produce_day = None
         for t in range(T):
             for p in compat_pools:
                 pkey = tuple(p.line_ids)
                 n = best_snapshot["prod_fresh"][pkey, t, oid] + best_snapshot["prod_nf"][pkey, t, oid]
                 if n:
                     cumulative += int(round(p.rate[oid])) * n
+                    if first_produce_day is None:
+                        first_produce_day = t // SLOTS_PER_DAY + 1
             if completion_day is None and cumulative >= o.quantity:
                 completion_day = t // SLOTS_PER_DAY + 1
         final_backlog = None
@@ -687,6 +797,7 @@ def build_and_solve(lines: list[Line], orders: list[Order], config: ScheduleConf
             "required": o.quantity,
             "produced": best_snapshot["produced_qty"][oid],
             "deadline_day": o.deadline_day,  # None이면 ASAP 주문
+            "first_produce_day": first_produce_day,  # 이 주문을 처음 생산(충포장)한 날. 한 번도 생산 안 됐으면 None.
             "completion_day": completion_day,
             "final_backlog": final_backlog,  # ASAP 주문에서만 값이 채워짐 (계획기간 마지막날 기준 잔여 미생산량)
         }

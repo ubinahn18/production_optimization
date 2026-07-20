@@ -43,20 +43,33 @@ from scheduling.models import Line, Order, ScheduleConfig
 from scheduling.report import plot_gantt, print_report, save_outputs
 from scheduling.solver import build_and_solve
 
-DEFAULT_EXCEL_PATH = r"C:\Users\USER\production_opt\수주현황_시뮬_filled01_0713.xlsx"
+DEFAULT_EXCEL_PATH = r"C:\Users\USER\production_opt\수주현황_시뮬_filled01_0719_version6.xlsx"
 
 # 제품군(category)별로 사용 가능한 라인 타입 + 그 라인에서 이 제품군을
 # 생산할 때 필요한 인원(workers)/시간당 생산량(rate). "같은 제품군이면
 # 전부 같은 값"이라는 단순화 가정 - 실제로는 제품(주문)마다 조금씩
 # 다르지만 그 세부 계산은 다음 단계에서 대체될 예정.
+#   setup_hours: 이 라인 타입에서 제품을 바꿀 때 걸리는 셋업 시간(시간
+#   단위, scheduling/models.py의 Line.setup_hours 참고). 2026-07-20
+#   기준 셀라인만 1시간이고 나머지 전 라인 타입은 2시간이다.
 CATEGORY_LINE_SPECS: dict[str, list[dict]] = {
     "용기": [
-        {"line_type_id": "셀라인", "count": 3, "workers": 10, "rate": 2340},
-        {"line_type_id": "단발", "count": 19, "workers": 6, "rate": 1140},
+        {"line_type_id": "셀라인", "count": 3, "workers": 10, "rate": 2340, "setup_hours": 1},
+        {"line_type_id": "단발", "count": 19, "workers": 6, "rate": 1140, "setup_hours": 2},
+    ],
+    # build_lines()가 물리 라인(count=1)을 만들 때만 쓰는 자리 - "셀바이오_
+    # 사각패드"와 같은 패턴으로, 이 키 자체는 Order.category 값과 매칭되지
+    # 않는다(엑셀 '제품군' 열에 "대용량파우치"라는 값은 없음 - 엑셀상으로는
+    # "용기" 카테고리 헤더 밑에 딸린 라인일 뿐). rate/workers는 --read-specs
+    # category 모드에서만 의미가 있는데 이 라인은 아직 --read-specs
+    # excel(제품별 실측값, LINE_SPEC_COLUMNS의 "대용량파우치")로만 쓰이므로
+    # 여기 숫자는 실제로 안 쓰인다 - count만 유효.
+    "대용량파우치": [
+        {"line_type_id": "대용량파우치", "count": 1, "workers": 0, "rate": 0, "setup_hours": 2},
     ],
     "마스크": [
-        {"line_type_id": "로타리", "count": 2, "workers": 7, "rate": 3000},
-        {"line_type_id": "10열기", "count": 6, "workers": 11, "rate": 8750},
+        {"line_type_id": "로타리", "count": 2, "workers": 7, "rate": 3000, "setup_hours": 2},
+        {"line_type_id": "10열기", "count": 6, "workers": 11, "rate": 8750, "setup_hours": 2},
     ],
     # 품명에 매수 표기(예: "10매")가 있고 단위가 "EA"인 마스크 주문 -
     # 데이터 로딩 단계(data_pipeline/orders_from_excel.py)에서 "마스크"
@@ -64,10 +77,10 @@ CATEGORY_LINE_SPECS: dict[str, list[dict]] = {
     # 위 "마스크"의 로타리와 같은 설비다(build_lines()가 line_type_id
     # 기준으로 중복 제거하므로 물리 라인이 따로 늘어나지는 않음).
     "마스크_멀티시트": [
-        {"line_type_id": "로타리", "count": 2, "workers": 7, "rate": 3000},
+        {"line_type_id": "로타리", "count": 2, "workers": 7, "rate": 3000, "setup_hours": 2},
     ],
     "튜브": [
-        {"line_type_id": "튜브라인", "count": 4, "workers": 10, "rate": 2100},
+        {"line_type_id": "튜브라인", "count": 4, "workers": 10, "rate": 2100, "setup_hours": 2},
     ],
     # 발주처가 "셀바이오휴먼텍"이고 품명에 "사각패드"가 들어가는 제품
     # 전용 라인. 엑셀상 category(제품군)는 "용기"로 찍혀 있지만 실제로는
@@ -77,7 +90,7 @@ CATEGORY_LINE_SPECS: dict[str, list[dict]] = {
     # Order.category 값과 매칭시키기 위한 용도가 아니라, build_lines()가
     # 물리 라인을 만들 때 순회하는 대상일 뿐이다.
     "셀바이오_사각패드": [
-        {"line_type_id": "셀바이오_라인", "count": 1, "workers": 12, "rate": 750},
+        {"line_type_id": "셀바이오_라인", "count": 1, "workers": 12, "rate": 750, "setup_hours": 2},
     ],
 }
 
@@ -117,9 +130,9 @@ MAX_DEADLINE_DAY = 30
 # 반영해 두면(20%는 이번엔 아예 빼고 다음 계획 주기의 "1~5일" 구간에서
 # 마저 반영됨), 다음 계획을 짤 때도 초반 며칠에 과한 쏠림이 생기지 않는다.
 EARLY_RAMP_DAYS = 5          # 납기 1~5일: 급함 완화 구간
-EARLY_RAMP_FRACTION = 0.2    # 위 구간에 반영할 수량 비율(나머지 80%는 이미 생산했다고 가정)
+EARLY_RAMP_FRACTION = 0.4    # 위 구간에 반영할 수량 비율(나머지 80%는 이미 생산했다고 가정)
 LATE_RAMP_DAYS = 5           # 납기 31~35일: 당겨서 반영하는 구간
-LATE_RAMP_FRACTION = 0.8     # 위 구간에 반영할 수량 비율(납기는 30일차로 당김)
+LATE_RAMP_FRACTION = 0.6     # 위 구간에 반영할 수량 비율(납기는 30일차로 당김)
 
 
 def build_lines() -> list[Line]:
@@ -140,14 +153,20 @@ def build_lines() -> list[Line]:
         for spec in specs:
             type_id = spec["line_type_id"]
             existing = lines_by_type.get(type_id)
+            spec_setup_hours = spec.get("setup_hours", 1)
             if existing is not None:
                 if existing.count != spec["count"]:
                     raise ValueError(
                         f"라인 타입 {type_id!r}이 서로 다른 count로 중복 정의됨: "
                         f"{first_category_by_type[type_id]}={existing.count} vs {category}={spec['count']}"
                     )
+                if existing.setup_hours != spec_setup_hours:
+                    raise ValueError(
+                        f"라인 타입 {type_id!r}이 서로 다른 setup_hours로 중복 정의됨: "
+                        f"{first_category_by_type[type_id]}={existing.setup_hours} vs {category}={spec_setup_hours}"
+                    )
                 continue
-            lines_by_type[type_id] = Line(line_type_id=type_id, count=spec["count"])
+            lines_by_type[type_id] = Line(line_type_id=type_id, count=spec["count"], setup_hours=spec_setup_hours)
             first_category_by_type[type_id] = category
     return list(lines_by_type.values())
 
@@ -258,7 +277,8 @@ def enforce_feasibility(
     count_by_type: dict[str, int],
     closed_days: frozenset[int],
     horizon_days: int,
-) -> tuple[list[Order], int]:
+    drop_blocking: bool = False,
+) -> tuple[list[Order], int, int]:
     """order_feasibility.describe_failures()로 [1]/[2]/[3](역전/구간
     전부 휴무일/라인 capa 부족) 중 하나라도 걸리는 주문을 찾아서, 둘 중
     하나로 처리한다:
@@ -270,18 +290,22 @@ def enforce_feasibility(
       또는 ASAP): "다음 주기로 미루면 그만"인 문제가 아니라 원료/부자재
       입고일이나 납기 데이터 자체를 조정해야 하는 문제다. 이런 주문을
       조용히 넘기면 CP-SAT이 한참 탐색한 뒤에야(또는 time-limit을
-      다 채우고서야) INFEASIBLE로 끝나버리므로, 그렇게 두지 않고 여기서
-      바로 프로그램을 종료한다 - 다만 한 건 걸리자마자 바로 종료하면
-      사람이 하나 고치고 다시 돌렸다가 또 다음 한 건에서 걸리는 걸
-      반복하게 되므로, 이 주문들을 전부 다 찾은 다음에 한꺼번에 알려주고
-      나서 종료한다.
+      다 채우고서야) INFEASIBLE로 끝나버리므로, 기본값(drop_blocking=False)
+      에서는 그렇게 두지 않고 여기서 바로 프로그램을 종료한다 - 다만 한
+      건 걸리자마자 바로 종료하면 사람이 하나 고치고 다시 돌렸다가 또
+      다음 한 건에서 걸리는 걸 반복하게 되므로, 이 주문들을 전부 다 찾은
+      다음에 한꺼번에 알려주고 나서 종료한다. drop_blocking=True
+      (--drop-infeasible 플래그)면 종료하는 대신 이 주문들도 late-ramp
+      대상과 마찬가지로 조용히 제외하고 계속 진행한다 - 원인 목록은
+      여전히 [오류]로 출력하되, 그게 실행을 막지는 않는다.
 
-    (필터링된 주문 목록, 다음 계획주기로 미뤄져서 제외된 건수)를
-    반환한다 - 후자는 plan_report.py의 "주문 필터링 요약" 표에 그대로
-    보여준다(자세한 사유는 위 안내 출력에 이미 나오므로 표에는 건수만)."""
+    (필터링된 주문 목록, 다음 계획주기로 미뤄져서 제외된 건수, 확정
+    납기인데 drop_blocking으로 제외된 건수)를 반환한다 - 뒤 둘은
+    plan_report.py의 "주문 필터링 요약" 표에 그대로 보여준다(자세한
+    사유는 위 안내 출력에 이미 나오므로 표에는 건수만)."""
     failures_by_id = describe_failures(orders, count_by_type, closed_days, horizon_days)
     if not failures_by_id:
-        return orders, 0
+        return orders, 0, 0
 
     kept: list[Order] = []
     blocking: list[tuple[Order, str]] = []
@@ -308,11 +332,16 @@ def enforce_feasibility(
     if blocking:
         for o, detail in blocking:
             print(f"[오류] {o.order_id}가 물리적으로 실행 불가능한 조건에 걸립니다: {detail}")
-        raise SystemExit(
-            f"[오류] 위 {len(blocking)}건은 이번 계획기간 안에 확정된 납기라 건너뛸 수 없습니다 - "
-            f"원료/부자재 입고예정일 또는 납기 데이터를 확인해서 조정한 뒤 다시 실행하세요."
+        if not drop_blocking:
+            raise SystemExit(
+                f"[오류] 위 {len(blocking)}건은 이번 계획기간 안에 확정된 납기라 건너뛸 수 없습니다 - "
+                f"원료/부자재 입고예정일 또는 납기 데이터를 확인해서 조정한 뒤 다시 실행하세요."
+            )
+        print(
+            f"[정보] --drop-infeasible 플래그로 위 {len(blocking)}건을 이번 계획에서 제외하고 계속 진행합니다 - "
+            f"원료/부자재 입고예정일 또는 납기 데이터를 나중에 확인해서 조정하세요."
         )
-    return kept, deferred_count
+    return kept, deferred_count, len(blocking)
 
 
 def resolve_closed_days(
@@ -414,6 +443,12 @@ def main():
         "--no-weekend-closure", action="store_true",
         help="주말도 근무일로 취급(기본은 주말 자동 휴무)",
     )
+    parser.add_argument(
+        "--drop-infeasible", action="store_true",
+        help="[1]/[2]/[3] feasibility 체크에 걸리는, 이번 계획기간 확정 납기인 주문을 만나도 "
+             "프로그램을 종료하는 대신 그 주문들만 제외하고 계속 진행(기본은 종료) - "
+             "원인은 여전히 [오류]로 출력됨, 나중에 데이터를 확인/조정해야 함",
+    )
     args = parser.parse_args()
 
     output_filenames = [
@@ -460,8 +495,12 @@ def main():
     )
 
     count_by_type = {l.line_type_id: l.count for l in lines}
-    orders, deferred_count = enforce_feasibility(orders, raw_deadline_by_id, count_by_type, closed_days, args.horizon_days)
+    orders, deferred_count, dropped_infeasible_count = enforce_feasibility(
+        orders, raw_deadline_by_id, count_by_type, closed_days, args.horizon_days,
+        drop_blocking=args.drop_infeasible,
+    )
     stats["excluded_feasibility_deferred"] = deferred_count
+    stats["excluded_feasibility_dropped"] = dropped_infeasible_count
     if not orders:
         print("[정보] feasibility 체크로 모든 주문이 제외되어 스케줄링할 주문이 없습니다. 종료.")
         return

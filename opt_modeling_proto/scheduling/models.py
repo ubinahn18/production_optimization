@@ -52,6 +52,14 @@ class Line:
 
     line_type_id: str
     count: int = 1  # 이 타입의 물리 설비 대수. 1이면 그냥 라인 하나.
+    setup_hours: int = 1
+        # 이 라인 타입에서 제품을 바꿀 때 걸리는 셋업 시간(슬롯=1시간
+        # 단위). 1이면 기존과 동일(셋업 1슬롯 후 바로 다음 슬롯 생산).
+        # 2면 셋업이 연속된 두 슬롯(1단계+2단계)에 걸쳐 진행되고, 그
+        # 다음 슬롯에야 생산이 시작된다 - 실제로 2026-07-20 기준 셀라인만
+        # 1시간이고 나머지 전 라인이 2시간으로 바뀜(scheduling/solver.py의
+        # 셋업 전이 제약 참고). 1/2 외의 값은 현재 solver.py가 지원하지
+        # 않는다.
 
 
 @dataclass
@@ -134,6 +142,7 @@ class LinePool:
     compat_order_ids: list[str]
     rate: dict[str, float]      # order_id -> 시간당 생산수량 (풀 내 모든 라인에 동일)
     workers: dict[str, int]     # order_id -> 필요인원 (풀 내 모든 라인에 동일)
+    setup_hours: int = 1        # Line.setup_hours 그대로(풀 내 모든 라인에 동일) - 1 또는 2
 
     @property
     def k(self) -> int:
@@ -147,7 +156,7 @@ class ScheduleConfig:
     hourly_wage: float | None = None  # None이면 daily_wage / 8 (정규 8시간 기준 시급으로 역산)
     overtime_multiplier: float = 1.5
     time_limit_seconds: float = 60.0
-    num_search_workers: int = 8       # CP-SAT 병렬 탐색 스레드 수
+    num_search_workers: int = 6       # CP-SAT 병렬 탐색 스레드 수
     random_seed: int = 42             # 고정해두면 같은 입력/설정에서 항상 같은 해가 나와 비교/재현이 쉬움
     log_progress: bool = False
 
@@ -207,7 +216,7 @@ class ScheduleResult:
     daily_workforce: dict            # {day(1-idx): 그날 고용 인원수}
     overtime_workers: dict           # {day(1-idx): {"17-18": 인원, "18-19": 인원}}
     line_activity: dict              # {line_id: [(day, slot_label, activity, order_id) ...]} (activity: "idle" / "setup:<product_id>" / "produce:<product_id>"; order_id는 idle이면 "", 아니면 그 activity를 발생시킨 주문. 여러 주문이 같은 product_id를 공유할 수 있어서(예: "코드확인중" 같은 placeholder) product_id만으로는 주문을 구분 못 할 수 있음 - order_id로 구분)
-    order_fulfillment: dict          # {order_id: {"required":.., "produced":.., "deadline_day":.., "completion_day":.. or None}}
+    order_fulfillment: dict          # {order_id: {"required":.., "produced":.., "deadline_day":.., "first_produce_day":.. or None, "completion_day":.. or None}}
     continuity_score: int | None = None  # 2단계 목적함수 값(대기<->생산 전환횟수 + 셋업횟수). 작을수록 라인이 안 끊기고 오래 이어짐.
     labor_cost: float | None = None      # 실제로 지급되는 돈: 일일 정액임금 합 + 잔업수당 합 (backlog 비용 제외).
     backlog_cost: float | None = None    # ASAP 주문 backlog 페널티 합 - 실제 지급되는 돈이 아니라 "늦게 끝낼수록 손해"를 모델링하기 위한 가상 비용.

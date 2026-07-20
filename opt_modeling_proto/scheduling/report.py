@@ -10,8 +10,18 @@ ScheduleResult를 사람이 보는 형태로 바꾸는 부분: 콘솔 리포트 
 from __future__ import annotations
 
 import os
+import re
 
 from .models import SLOTS_PER_DAY, Order, ScheduleConfig, ScheduleResult
+
+
+def _natural_line_key(lid: str):
+    """"단발_2"가 "단발_10"보다 앞에 오도록, 끝의 숫자를 정수로 뽑아
+    비교하는 정렬 키(문자열 사전순 정렬은 "10"을 "2"보다 앞에 둠)."""
+    m = re.match(r"^(.*?)(\d+)$", lid)
+    if m:
+        return (m.group(1), int(m.group(2)))
+    return (lid, -1)
 
 
 def _compress_runs(entries: list[tuple[int, str, str, str]]) -> list[tuple[int, str, int, str, str, str]]:
@@ -79,16 +89,6 @@ def print_report(result: ScheduleResult, orders: list[Order]):
     for d in list(result.daily_workforce.keys())[:10]:
         ot = result.overtime_workers[d]
         print(f"  {d:>2}일차: 고용 {result.daily_workforce[d]:>3}명  (잔업 17-18: {ot['17-18']:>2}명, 18-19: {ot['18-19']:>2}명)")
-
-    print("\n[결과] 라인별 활동 요약 (연속 구간 압축, 라인당 앞 8개 구간만 표시):")
-    for lid, entries in result.line_activity.items():
-        runs = _compress_runs(entries)
-        print(f"  [{lid}]")
-        for sd, ss, ed, es, activity, order_id in runs[:8]:
-            suffix = f" ({order_id})" if order_id else ""
-            print(f"    {sd}일 {ss} ~ {ed}일 {es} : {activity}{suffix}")
-        if len(runs) > 8:
-            print(f"    ... (총 {len(runs)}개 구간, 나머지는 CSV 참고)")
 
 
 def save_outputs(result: ScheduleResult, orders: list[Order], output_dir: str):
@@ -175,10 +175,13 @@ def plot_gantt(result: ScheduleResult, orders: list[Order], config: ScheduleConf
     # 동일 라인이 많은 그룹(예: 단발 19대)에서 실제로 쓰인 몇 대만 빼고
     # 나머지가 전부 회색 idle 줄로 차트를 채워서 정작 중요한 부분이
     # 안 보이게 되는 걸 막기 위함.
-    # 스크립트마다 라인 순서가 제각각이면 비교하기 어려우므로 가나다순으로 통일.
+    # 스크립트마다 라인 순서가 제각각이면 비교하기 어려우므로 통일해서
+    # 정렬한다 - 단순 문자열 정렬("단발_10"이 "단발_2"보다 앞에 옴)이 아니라
+    # 끝 숫자를 정수로 비교하는 자연 정렬을 쓴다.
     line_ids = sorted(
-        lid for lid, entries in result.line_activity.items()
-        if any(activity != "idle" for _, _, activity, _ in entries)
+        (lid for lid, entries in result.line_activity.items()
+         if any(activity != "idle" for _, _, activity, _ in entries)),
+        key=_natural_line_key,
     )
     T = config.horizon_days * SLOTS_PER_DAY
     # 색상/범례는 order_id(주문) 단위로 나눈다 - product_id는 진짜 식별자가
