@@ -11,7 +11,7 @@ let saveTimer = null;
 
 let currentTransition = 0;   // 0..8: 슬롯 currentTransition -> currentTransition+1 전환 편집 중
 let selectedSourceKey = null; // 전환 편집기에서 선택된 출발 항목의 key(라인id 또는 IDLE_KEY)
-let hiddenArrowIds = new Set(); // 화면에서만 숨긴 화살표(edge.id) - 실제 배정은 그대로 남아있음, 서버에 저장 안 함
+let autoConnectSameLine = false; // "연속 작업 연결" 체크박스 - 켜져 있는 동안만 적용되는 화면 모드, 서버에 저장 안 함
 let arrowDisplayReduction = {}; // 우클릭으로 수동으로 줄인 화면 표시량: {edge.id: 뺄 숫자} - 실제 edge.count는 안 건드림, 서버에 저장 안 함
 
 // 인원 추적(트리) 관련 - 트리 데이터 자체(state.tracking)는 서버에
@@ -56,10 +56,11 @@ async function loadDay(day) {
   currentDay = day;
   currentTransition = 0;
   selectedSourceKey = null;
-  hiddenArrowIds = new Set();
   arrowDisplayReduction = {};
   pendingNewTrack = false;
   activeTrackInfo = null;
+  autoConnectSameLine = false;
+  document.getElementById("autoConnectSameLine").checked = false;
   document.getElementById("daySelect").value = String(day);
   setSaveStatus("idle");
   renderAll();
@@ -439,6 +440,44 @@ function remainingFor(items, edges, side) {
   return result;
 }
 
+// "연속 작업 연결"이 켜져 있을 때 호출됨 - 이번 전환(currentTransition)의
+// 출발/도착 목록에서, 같은 라인(id)이면서 필요인원(total)이 완전히
+// 같은 짝을 찾아 자동으로 이어준다(이미 그만큼 이어져 있으면 다시
+// 안 건드림). 렌더링/저장은 호출자가 처리하도록, 여기선 state.flows만
+// 고치고 뭔가 바뀌었으면 true를 반환한다.
+function autoConnectMatchingLines() {
+  const srcItems = itemsForSlot(currentTransition);
+  const dstItems = itemsForSlot(currentTransition + 1);
+  const edges = edgesForTransition(currentTransition);
+  const srcRemaining = remainingFor(srcItems, edges, "src");
+  const dstRemaining = remainingFor(dstItems, edges, "dst");
+  const dstByKey = {};
+  for (const it of dstItems) dstByKey[it.key] = it;
+
+  let changed = false;
+  for (const s of srcItems) {
+    if (s.key === IDLE_KEY) continue; // "같은 라인"이 아니라 미배치/휴식이므로 대상 아님
+    const d = dstByKey[s.key];
+    if (!d || s.total !== d.total) continue;
+    const amount = Math.min(srcRemaining[s.key] || 0, dstRemaining[d.key] || 0);
+    if (amount <= 0) continue;
+
+    const existing = edges.find((e) => e.srcLine === s.key && e.dstLine === s.key);
+    if (existing) {
+      existing.count += amount;
+    } else {
+      edges.push({
+        id: `edge_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        srcLine: s.key, dstLine: s.key, count: amount,
+      });
+    }
+    srcRemaining[s.key] -= amount;
+    dstRemaining[d.key] -= amount;
+    changed = true;
+  }
+  return changed;
+}
+
 function transitionLabel(t) {
   return `${state.slot_labels[t]} → ${state.slot_labels[t + 1]}`;
 }
@@ -448,6 +487,15 @@ function renderTransitionEditor() {
   if (currentTransition < 0) currentTransition = 0;
   if (currentTransition > maxT) currentTransition = maxT;
   document.getElementById("transitionLabel").textContent = transitionLabel(currentTransition);
+
+  // "연속 작업 연결"이 켜져 있으면, 렌더링 직전에 이번 전환에서 아직
+  // 안 이어진 "같은 라인 + 같은 필요인원" 짝을 자동으로 다 이어준다.
+  // (DOM/렌더 함수를 호출하지 않고 state.flows만 조용히 고쳐서, 바로
+  // 아래 이어지는 정상적인 렌더링 한 번으로 결과가 반영되게 한다 -
+  // 여기서 renderTransitionEditor를 다시 부르면 무한 재귀가 됨.)
+  if (autoConnectSameLine && autoConnectMatchingLines()) {
+    scheduleSave();
+  }
 
   const srcItems = itemsForSlot(currentTransition);
   const dstItems = itemsForSlot(currentTransition + 1);
@@ -503,7 +551,6 @@ function drawFlowArrows() {
   for (let t = 0; t <= maxT; t++) {
     const edges = edgesForTransition(t);
     for (const e of edges) {
-      if (hiddenArrowIds.has(e.id)) continue; // 화면에서만 숨김 - 데이터는 그대로 있음
       const srcTd = findGridCell(e.srcLine, t);
       const dstTd = findGridCell(e.dstLine, t + 1);
       if (!srcTd || !dstTd) continue;
@@ -551,12 +598,11 @@ function drawOneArrow(svg, contRect, container, srcTd, dstTd, edge, transitionId
   hit.setAttribute("d", d3);
   hit.setAttribute("class", "flowArrowHit");
   hit.addEventListener("click", () => {
-    // 추적 시작 대기 중이거나, 이 화살표가 지금 활성 추적 노드의
-    // 위치에서 뻗어나가는 것이면 "숨기기"가 아니라 "추적 확장"으로
-    // 처리한다. 그 외엔 평소처럼 화면에서만 숨긴다.
-    if (tryExtendTracking(edge, transitionIdx)) return;
-    hiddenArrowIds.add(edgeId);
-    drawFlowArrows();
+    // 클릭으로 화살표를 숨기는 기능은 인원 추적 중에 실수로 화살표가
+    // 없어지는 문제가 있어서 없앴다 - 이제 클릭은 추적 확장 시도만
+    // 한다(추적 중이 아니면 아무 동작도 안 함). 화면에서 숨기고 싶으면
+    // 우클릭으로 표시 숫자를 줄이는 기능만 남아있다.
+    tryExtendTracking(edge, transitionIdx);
   });
   hit.addEventListener("contextmenu", (ev) => {
     ev.preventDefault();
@@ -649,18 +695,30 @@ function tryExtendTracking(edge, transitionIdx) {
 
   if (pendingNewTrack) {
     const treeId = genTrackId("track");
-    const nodeId = genTrackId("node");
+    const startNodeId = genTrackId("node");
+    const firstNodeId = genTrackId("node");
     const color = TRACK_COLORS[Object.keys(state.tracking).length % TRACK_COLORS.length];
-    const node = {
-      id: nodeId, count: available, lineId: edge.dstLine, slotIdx: transitionIdx + 1,
-      edgeId: edge.id, parentId: null, childIds: [],
+
+    // 화살표를 처음 골라서 추적을 시작하는 순간, 그 화살표의 "출발점"
+    // (도착점보다 슬롯 하나 이전)도 트리의 실제 노드로 같이 만들어둔다.
+    // 안 그러면 예를 들어 08-09→09-10 화살표로 추적을 시작했을 때
+    // 08-09 슬롯 자체는 트리/엑셀 내보내기 어디에도 안 나오게 된다 -
+    // 화살표를 고른 시점에 이미 그 출발 라인을 알고 있으니 굳이 뺄
+    // 이유가 없다.
+    const startNode = {
+      id: startNodeId, count: available, lineId: edge.srcLine, slotIdx: transitionIdx,
+      edgeId: null, parentId: null, childIds: [firstNodeId],
+    };
+    const firstNode = {
+      id: firstNodeId, count: available, lineId: edge.dstLine, slotIdx: transitionIdx + 1,
+      srcLine: edge.srcLine, edgeId: edge.id, parentId: startNodeId, childIds: [],
     };
     state.tracking[treeId] = {
       id: treeId, label: `그룹${Object.keys(state.tracking).length + 1}`, color,
-      rootNodeId: nodeId, nodes: { [nodeId]: node },
+      rootNodeId: startNodeId, nodes: { [startNodeId]: startNode, [firstNodeId]: firstNode },
     };
     pendingNewTrack = false;
-    activeTrackInfo = { treeId, nodeId };
+    activeTrackInfo = { treeId, nodeId: firstNodeId };
     renderAll();
     scheduleSave();
     return true;
@@ -693,6 +751,7 @@ function tryExtendTracking(edge, transitionIdx) {
   const newNodeId = genTrackId("node");
   const newNode = {
     id: newNodeId, count: takenAmount, lineId: edge.dstLine, slotIdx: transitionIdx + 1,
+    srcLine: edge.srcLine,
     edgeId: edge.id, parentId: nodeId, childIds: [],
   };
   tree.nodes[newNodeId] = newNode;
@@ -834,9 +893,9 @@ function scheduleRedrawArrows() {
 }
 window.addEventListener("resize", scheduleRedrawArrows);
 document.getElementById("gridScroll").addEventListener("scroll", scheduleRedrawArrows, { passive: true });
-document.getElementById("showAllArrowsBtn").addEventListener("click", () => {
-  hiddenArrowIds = new Set();
-  drawFlowArrows();
+document.getElementById("autoConnectSameLine").addEventListener("change", (ev) => {
+  autoConnectSameLine = ev.target.checked;
+  renderTransitionEditor(); // 켜지는 순간 지금 보고 있는 전환에 바로 적용
 });
 document.getElementById("newTrackBtn").addEventListener("click", () => {
   if (pendingNewTrack) {
@@ -844,6 +903,38 @@ document.getElementById("newTrackBtn").addEventListener("click", () => {
     updateTrackingButtonUI();
   } else {
     startNewTrack();
+  }
+});
+document.getElementById("exportTrackingBtn").addEventListener("click", async () => {
+  const btn = document.getElementById("exportTrackingBtn");
+  if (!Object.keys(state.tracking).length) {
+    alert("아직 추적 중인 그룹이 없습니다. 먼저 인원 추적을 시작하세요.");
+    return;
+  }
+  const orig = btn.textContent;
+  btn.textContent = "내보내는 중...";
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/api/day/${currentDay}/export_tracking`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(state),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `day${currentDay}_인원추적_시간표.xlsx`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    alert("엑셀 내보내기에 실패했습니다: " + err.message);
+  } finally {
+    btn.textContent = orig;
+    btn.disabled = false;
   }
 });
 

@@ -10,6 +10,7 @@ button.linklike {
   display: block;
 }
 button.linklike:hover { color: #1a5a80; }
+button.linklike:disabled { color: #999; cursor: default; text-decoration: none; }
 button.linklike.pending {
   color: white;
   background: #e67e22;
@@ -354,6 +355,16 @@ table#grid th.lineNameHeader {
   padding: 2px 8px;
 }
 #transitionLabel { font-weight: 600; min-width: 130px; text-align: center; }
+
+.autoConnectLabel {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: #444;
+  margin: 2px 0 8px 0;
+  cursor: pointer;
+}
 
 .transitionCols {
   display: flex;

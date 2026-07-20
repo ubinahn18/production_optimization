@@ -45,8 +45,11 @@
         <span id="transitionLabel">-</span>
         <button id="nextTransBtn" title="다음 전환">▶</button>
       </div>
-      <p class="hint">왼쪽(출발)을 클릭하고 오른쪽(도착)을 클릭하면 그대로 전체 이동으로 연결됩니다. 일부만 옮기려면 아래 "이동 배정" 목록에서 숫자를 줄이세요. 표 위의 화살표: <b>클릭</b>하면 화면에서 숨겨지고, <b>우클릭</b>하면 화면에 표시되는 숫자만 줄일 수 있습니다(둘 다 실제 배정은 안 바뀜).</p>
-      <button id="showAllArrowsBtn" type="button" class="linklike">숨긴 화살표 전부 다시 보이기</button>
+      <p class="hint">왼쪽(출발)을 클릭하고 오른쪽(도착)을 클릭하면 그대로 전체 이동으로 연결됩니다. 일부만 옮기려면 아래 "이동 배정" 목록에서 숫자를 줄이세요. 표 위의 화살표: <b>우클릭</b>하면 화면에 표시되는 숫자만 줄일 수 있습니다(실제 배정은 안 바뀜). 인원 추적 중일 땐 <b>클릭</b>으로 추적을 이어갈 수 있습니다.</p>
+      <label class="autoConnectLabel">
+        <input type="checkbox" id="autoConnectSameLine">
+        연속 작업 연결 (같은 라인 + 필요인원이 같으면 자동 연결)
+      </label>
       <div class="transitionCols">
         <div class="transitionCol">
           <div class="transitionColTitle">출발 (이전 슬롯)</div>
@@ -68,6 +71,7 @@
       <p class="hint" id="trackingHint">"새 추적 시작"을 누른 뒤 화살표를 클릭하면 그 인원수만큼 추적이 시작됩니다. 트리에서 노드를 클릭해 "활성 노드"로 고른 뒤 다른 화살표를 클릭하면 그 지점에서 새 가지가 생깁니다.</p>
       <button id="newTrackBtn" type="button" class="linklike">+ 새 추적 시작</button>
       <div id="trackingList"></div>
+      <button id="exportTrackingBtn" type="button" class="linklike">시간표 내보내기(엑셀)</button>
     </div>
   </aside>
 </main>

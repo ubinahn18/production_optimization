@@ -30,18 +30,25 @@ staffing_app.py
 동일하다(plot_day.py/labor_utilization.py와 같은 방식) - line_schedule.csv/
 daily_workforce.csv는 그대로 읽고, 라인별 필요인원(workers)만 다시 계산
 (엑셀 재로딩 필요, 시간이 좀 걸림 - 서버 기동 시 한 번만).
+
+기본적으로 HTTP Basic Auth 비밀번호 보호가 켜져 있다(기본 비밀번호는
+_DEFAULT_PASSWORD 참고, --password로 바꾸거나 --no-password로 끌 수
+있음) - ngrok 등으로 외부에 링크를 공유해도 비밀번호 없이는 못 들어옴.
 """
 
 from __future__ import annotations
 
 import argparse
+import colorsys
 import io
 import json
 import os
+import re
+import secrets
 import sys
 
 import pandas as pd
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_file, send_from_directory
 
 # opt_modeling_proto/ 자체(현재 파일 위치)와 output/(스크립트 폴더, 패키지
 # 아님)를 둘 다 import 경로에 추가해야 _data_source.py와 scheduling 패키지를
@@ -59,6 +66,52 @@ from scheduling.models import SLOT_LABELS  # noqa: E402
 from scheduling.report import _natural_line_key  # noqa: E402
 
 app = Flask(__name__, static_folder=os.path.join(_HERE, "staffing_static"), static_url_path="")
+
+# 사람이 원하는 라인 표시 순서(카테고리 단위) - 이 목록에 없는 카테고리는
+# 뒤로 밀린다. 같은 카테고리 안에서는 _natural_line_key로 번호순 정렬
+# (예: 단발_2가 단발_10보다 앞).
+_LINE_CATEGORY_ORDER = ["셀라인", "단발", "10열기", "로타리", "튜브라인"]
+
+
+def _line_category(lid: str) -> str:
+    """line_id에서 끝의 '_숫자'를 뗀 카테고리 이름(예: '단발_10' -> '단발').
+    끝에 '_숫자'가 없는 라인(예: '대용량파우치')은 그 자체가 카테고리."""
+    m = re.match(r"^(.*?)_(\d+)$", lid)
+    return m.group(1) if m else lid
+
+
+def _line_sort_key(lid: str):
+    category = _line_category(lid)
+    try:
+        rank = _LINE_CATEGORY_ORDER.index(category)
+    except ValueError:
+        rank = len(_LINE_CATEGORY_ORDER)
+    return (rank, _natural_line_key(lid))
+
+# --password로 지정했을 때만 켜지는 아주 단순한 접근 보호(HTTP Basic
+# Auth). ngrok 등으로 외부에 링크를 공유할 때, 그 링크를 우연히/실수로
+# 본 사람이 바로 데이터를 보거나 고칠 수 없게 최소한의 문턱을 둔다.
+# 아이디는 아무거나 상관없고 비밀번호만 확인한다.
+_PASSWORD: str | None = None
+
+# 외부 공유(ngrok 등) 시 매번 --password를 타이핑하지 않아도 되도록 둔
+# 기본 비밀번호. --no-password로 끌 수 있고, --password로 다른 값을 줄
+# 수도 있다.
+_DEFAULT_PASSWORD = "cCQnf4zvTRFAsK"
+
+
+@app.before_request
+def _check_password():
+    if not _PASSWORD:
+        return None
+    auth = request.authorization
+    if not auth or not secrets.compare_digest(auth.password or "", _PASSWORD):
+        return (
+            "인증이 필요합니다.",
+            401,
+            {"WWW-Authenticate": 'Basic realm="staffing"'},
+        )
+    return None
 
 # 모듈 전역 상태 - 이 도구는 개인 로컬 도구라 단일 사용자/단일 프로세스
 # 가정하고 단순하게 전역 변수에 들고 있는다(멀티유저 동시접속 고려 안 함).
@@ -150,6 +203,49 @@ def _build_fresh_day_state(day: int) -> dict:
     }
 
 
+def _migrate_tracking_add_start_nodes(data: dict) -> None:
+    """예전 버전에서 만들어진 추적 트리는 뿌리 노드가 "첫 화살표의
+    도착점"이었다(그 화살표의 출발 슬롯 자체는 트리에 없었음). 뿌리의
+    출발 라인을 아래 순서로 찾아서, 찾아지면 뿌리 앞에 그 출발점을
+    실제 노드로 끼워넣어 새 스키마와 똑같이 맞춘다:
+      1) 뿌리에 srcLine 필드가 이미 있으면 그걸 씀(중간 버전 데이터).
+      2) 없으면(가장 옛날 데이터), 뿌리의 edgeId가 가리키는 화살표가
+         아직 flows에 남아있는지 찾아서 그 화살표의 srcLine을 씀.
+      3) 그것도 못 찾으면(화살표가 이미 삭제됨 등) 알 방법이 없으므로
+         그대로 둔다.
+    이미 새 스키마인 트리(뿌리에 edgeId 자체가 없음)는 건드리지 않고,
+    한 번 마이그레이션된 트리는 재실행해도 다시 안 건드린다.
+    """
+    flows = data.get("flows") or {}
+    for tree in (data.get("tracking") or {}).values():
+        nodes = tree.get("nodes") or {}
+        root_id = tree.get("rootNodeId")
+        root = nodes.get(root_id)
+        if not root or not root.get("edgeId"):
+            continue  # 이미 새 스키마(시작 노드가 뿌리, edgeId 없음)
+
+        src_line = root.get("srcLine")
+        if src_line is None:
+            transition_key = str(root["slotIdx"] - 1)
+            for e in flows.get(transition_key, []):
+                if e.get("id") == root["edgeId"]:
+                    src_line = e.get("srcLine")
+                    break
+        if src_line is None:
+            continue  # 정말로 알 방법이 없음(화살표가 이미 삭제됐거나 수정됨)
+
+        start_id = f"migrated_start_{root_id}"
+        if start_id in nodes:
+            continue
+        nodes[start_id] = {
+            "id": start_id, "count": root.get("count", 0),
+            "lineId": src_line, "slotIdx": root["slotIdx"] - 1,
+            "edgeId": None, "parentId": None, "childIds": [root_id],
+        }
+        root["parentId"] = start_id
+        tree["rootNodeId"] = start_id
+
+
 def _migrate_saved_state(data: dict) -> dict:
     """예전 저장 형식을 지금 스키마로 보정한다(둘 다 없으면 그대로,
     있으면 그 부분만 채워넣음 - 매번 전부 다시 만들 필요 없음).
@@ -190,7 +286,71 @@ def _migrate_saved_state(data: dict) -> dict:
     if "tracking" not in data:
         data["tracking"] = {}
 
+    _migrate_tracking_add_start_nodes(data)
+
+    # "lines"는 화면에 보여줄 순서일 뿐 실제 배정 데이터(grid/flows)와는
+    # 무관하므로, 표시 순서 기준(_line_sort_key)이 바뀌면 예전에 저장된
+    # 날짜도 매번 최신 순서로 다시 정렬해서 보여준다(한 번만 채워넣는
+    # 다른 필드들과 달리, 이건 매 로드마다 다시 적용).
+    if "lines" in data:
+        data["lines"] = sorted(data["lines"], key=_line_sort_key)
+
     return data
+
+
+def _hash_hue(text: str) -> int:
+    """app.js의 hashHue()와 같은 계산 - 라인 id마다 고정된 hue를 뽑는다."""
+    h = 0
+    for ch in text:
+        h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+    return h % 360
+
+
+def _line_fill_hex(line_id: str) -> str:
+    """app.js의 productColor()(hsl(hue, 65%, 83%))와 같은 파스텔 색을
+    엑셀 셀 배경색(PatternFill)에 쓸 RGB 16진수로 변환."""
+    hue = _hash_hue(line_id) / 360.0
+    r, g, b = colorsys.hls_to_rgb(hue, 0.83, 0.65)  # colorsys는 (h, l, s) 순서
+    return "{:02X}{:02X}{:02X}".format(int(r * 255), int(g * 255), int(b * 255))
+
+
+def _reconstruct_leaf_timetables(data: dict) -> list[dict]:
+    """state.tracking의 각 추적 트리에서, 자식이 없는 노드(가지 끝)마다
+    그 부분집합이 하루 동안 슬롯별로 어느 라인에 있었는지를 뿌리까지
+    거슬러 올라가며 재구성한다. 뿌리 노드는 "도착한 슬롯/라인"만 들고
+    있으므로, 뿌리 바로 이전 슬롯(추적을 시작한 화살표의 출발점)은
+    노드에 같이 저장해둔 srcLine으로 채운다. 추적이 닿지 않은 슬롯은
+    결과 딕셔너리에 아예 키가 없다(모른다는 뜻 - 빈 칸으로 표시).
+    """
+    results: list[dict] = []
+    for tree in (data.get("tracking") or {}).values():
+        nodes = tree.get("nodes") or {}
+        leaf_ids = [nid for nid, nd in nodes.items() if not nd.get("childIds")]
+        for leaf_id in leaf_ids:
+            chain = []
+            cur = nodes.get(leaf_id)
+            while cur is not None:
+                chain.append(cur)
+                parent_id = cur.get("parentId")
+                cur = nodes.get(parent_id) if parent_id else None
+            if not chain:
+                continue
+            chain.reverse()  # 이제 뿌리 -> 리프 순서
+
+            slot_line: dict[int, str] = {}
+            root = chain[0]
+            if root.get("srcLine") is not None:
+                slot_line[root["slotIdx"] - 1] = root["srcLine"]
+            for nd in chain:
+                slot_line[nd["slotIdx"]] = nd["lineId"]
+
+            leaf_node = chain[-1]
+            results.append({
+                "tree_label": tree.get("label", ""),
+                "count": leaf_node.get("count", 0),
+                "slot_line": slot_line,
+            })
+    return results
 
 
 @app.route("/")
@@ -240,13 +400,101 @@ def api_reset_day(day: int):
     return jsonify(_build_fresh_day_state(day))
 
 
+@app.route("/api/day/<int:day>/export_tracking", methods=["POST"])
+def api_export_tracking(day: int):
+    """인원 추적 트리들을, 가지(리프)마다 그날 시간표 한 줄로 정리한
+    엑셀 파일을 만들어 내려준다. 화면에 떠 있는(아직 저장 안 됐을 수도
+    있는) 최신 상태를 그대로 요청 본문으로 받아서 쓴다(디스크에 저장된
+    파일을 다시 읽지 않음 - 저장 디바운스 타이밍과 무관하게 항상 지금
+    보고 있는 화면 그대로 내보내기 위함)."""
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    data = request.get_json(force=True)
+    rows = _reconstruct_leaf_timetables(data)
+    if not rows:
+        return jsonify({"error": "추적 중인 그룹이 없습니다."}), 400
+
+    slot_labels = data.get("slot_labels") or []
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"{day}일차 인원추적"[:31]  # 엑셀 시트명 31자 제한
+
+    header_font = Font(bold=True)
+    header_fill = PatternFill("solid", fgColor="D9E1F2")
+    idle_fill = PatternFill("solid", fgColor="F2F2F2")
+
+    headers = ["추적 그룹", "가지", "인원수"] + list(slot_labels)
+    for c, h in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=c, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    # 같은 트리(그룹) 안에서 가지 번호(1, 2, 3...)를 순서대로 매긴다.
+    tree_branch_no: dict[str, int] = {}
+    r = 2
+    for row in rows:
+        tree_label = row["tree_label"]
+        tree_branch_no[tree_label] = tree_branch_no.get(tree_label, 0) + 1
+        branch_no = tree_branch_no[tree_label]
+
+        ws.cell(row=r, column=1, value=tree_label)
+        ws.cell(row=r, column=2, value=f"가지 {branch_no}")
+        ws.cell(row=r, column=3, value=row["count"])
+        for si in range(len(slot_labels)):
+            line_id = row["slot_line"].get(si)
+            if line_id is None:
+                continue
+            cell = ws.cell(row=r, column=4 + si)
+            cell.alignment = Alignment(horizontal="center")
+            if line_id == "__idle__":
+                cell.value = "미배치/휴식"
+                cell.fill = idle_fill
+            else:
+                cell.value = line_id
+                cell.fill = PatternFill("solid", fgColor=_line_fill_hex(line_id))
+        r += 1
+
+    ws.column_dimensions["A"].width = 16
+    ws.column_dimensions["B"].width = 10
+    ws.column_dimensions["C"].width = 8
+    for c in range(4, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 13
+    ws.freeze_panes = "D2"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=f"day{day}_tracking.xlsx",
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="30일 계획 결과를 놓고 하루치 인원 배치를 수작업으로 조정하는 로컬 웹 도구")
     parser.add_argument("--dir", default=None, help="line_schedule.csv/daily_workforce.csv가 있는 디렉터리")
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--no-browser", action="store_true", help="자동으로 브라우저를 열지 않음")
+    parser.add_argument(
+        "--password", default=_DEFAULT_PASSWORD,
+        help=f"접속 시 HTTP Basic Auth로 요구할 비밀번호(기본값: '{_DEFAULT_PASSWORD}', ngrok 등으로 "
+             "외부 공유할 때 매번 --password를 안 줘도 자동 적용됨)",
+    )
+    parser.add_argument(
+        "--no-password", action="store_true",
+        help="비밀번호 보호를 끄고 실행(로컬(127.0.0.1)에서만 쓸 때)",
+    )
     add_source_args(parser)
     args = parser.parse_args()
+
+    global _PASSWORD
+    _PASSWORD = None if args.no_password else args.password
 
     print("[정보] 라인/주문 데이터 로딩 중(필요인원 계산용, 시간이 좀 걸릴 수 있습니다)...")
     # resolve_source()의 --real-plan 기본 디렉터리는 "script_dir/real_plan"으로
@@ -262,7 +510,7 @@ def main():
     schedule_df = pd.read_csv(schedule_path)
     workforce_df = pd.read_csv(workforce_path)
 
-    all_lines = sorted(schedule_df["line_id"].unique().tolist(), key=_natural_line_key)
+    all_lines = sorted(schedule_df["line_id"].unique().tolist(), key=_line_sort_key)
 
     STATE["schedule_df"] = schedule_df
     STATE["workforce_df"] = workforce_df
@@ -273,6 +521,8 @@ def main():
     print(f"[정보] {schedule_path} 로드 완료 (라인 {len(all_lines)}개, {schedule_df['day'].nunique()}일치)")
     print(f"[정보] 편집 상태 저장 위치: {STATE['state_dir']}")
     print(f"[정보] http://127.0.0.1:{args.port} 에서 접속하세요")
+    if _PASSWORD:
+        print("[정보] 비밀번호 보호가 켜져 있습니다(아이디는 아무거나, 비밀번호만 확인).")
 
     if not args.no_browser:
         import threading
