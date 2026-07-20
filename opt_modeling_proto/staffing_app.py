@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import colorsys
+import hashlib
 import io
 import json
 import os
@@ -123,6 +124,14 @@ STATE: dict = {
     "all_lines": None,         # 자연정렬된 전체 물리 라인 목록(36개 등) - 정렬 기준 및
                                # "그날 활동 있는 라인만" 필터링의 기준 순서로 쓰임(day
                                # 자체의 표시 목록은 아님, _build_fresh_day_state 참고)
+    "schedule_fingerprint": None,  # line_schedule.csv 내용의 sha256 - 저장된 날짜별 상태가
+                                    # "지금 로드된 계획"과 같은 계획을 기준으로 만들어진 건지
+                                    # 판별하는 데 씀(아래 api_get_day 참고). plan_from_orders.py를
+                                    # 다시 돌려서 계획이 바뀌면 이 값도 바뀌므로, 예전에 저장해둔
+                                    # 날짜를 열어도 그 예전 스케줄이 아니라 최신 스케줄 기준으로
+                                    # 새로 만들어진다(사람이 하루하루 초기화 안 눌러도 됨) -
+                                    # 2026-07-21: "새 스케줄 돌리면 인원배치 도구도 그 스케줄
+                                    # 기준으로 맞춰져야 한다"는 실제 요청 반영.
 }
 
 
@@ -200,6 +209,9 @@ def _build_fresh_day_state(day: int) -> dict:
         # 사람이 직접 클릭해서 추적해둔 트리(들). 실제 배정과는 무관한
         # 순수 주석/추적용 데이터.
         "tracking": {},
+        # 이 상태가 어느 line_schedule.csv 내용을 기준으로 만들어졌는지
+        # (api_get_day의 최신성 검사에서 씀).
+        "schedule_fingerprint": STATE["schedule_fingerprint"],
     }
 
 
@@ -378,6 +390,15 @@ def api_get_day(day: int):
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        # 저장된 날짜가 "지금 로드된 계획"과 다른 계획(plan_from_orders.py를
+        # 다시 돌려서 line_schedule.csv 내용 자체가 바뀐 경우) 기준으로
+        # 만들어졌다면, 그 예전 저장을 그대로 보여주지 않고 최신 계획
+        # 기준으로 새로 만든다 - 서버를 재시작만 한 경우(계획은 그대로)는
+        # fingerprint가 안 바뀌므로 저장된 내용이 정상적으로 그대로
+        # 유지된다. 예전 파일은 지우지 않는다 - 다시 저장하면 그때
+        # 최신 계획 기준 내용으로 자연스럽게 덮어써진다.
+        if data.get("schedule_fingerprint") != STATE["schedule_fingerprint"]:
+            return jsonify(_build_fresh_day_state(day))
         data = _migrate_saved_state(data)
         return jsonify(data)
     return jsonify(_build_fresh_day_state(day))
@@ -507,7 +528,10 @@ def main():
 
     schedule_path = os.path.join(args.dir, "line_schedule.csv")
     workforce_path = os.path.join(args.dir, "daily_workforce.csv")
-    schedule_df = pd.read_csv(schedule_path)
+    with open(schedule_path, "rb") as f:
+        schedule_bytes = f.read()
+    schedule_fingerprint = hashlib.sha256(schedule_bytes).hexdigest()
+    schedule_df = pd.read_csv(io.BytesIO(schedule_bytes))
     workforce_df = pd.read_csv(workforce_path)
 
     all_lines = sorted(schedule_df["line_id"].unique().tolist(), key=_line_sort_key)
@@ -517,6 +541,7 @@ def main():
     STATE["workers_lookup"] = workers_lookup
     STATE["all_lines"] = all_lines
     STATE["state_dir"] = os.path.join(args.dir, "staffing_state")
+    STATE["schedule_fingerprint"] = schedule_fingerprint
 
     print(f"[정보] {schedule_path} 로드 완료 (라인 {len(all_lines)}개, {schedule_df['day'].nunique()}일치)")
     print(f"[정보] 편집 상태 저장 위치: {STATE['state_dir']}")
