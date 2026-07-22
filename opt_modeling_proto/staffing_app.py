@@ -457,6 +457,7 @@ def api_export_tracking(day: int):
     # 같은 트리(그룹) 안에서 가지 번호(1, 2, 3...)를 순서대로 매긴다.
     tree_branch_no: dict[str, int] = {}
     r = 2
+    total_headcount = 0
     for row in rows:
         tree_label = row["tree_label"]
         tree_branch_no[tree_label] = tree_branch_no.get(tree_label, 0) + 1
@@ -465,6 +466,7 @@ def api_export_tracking(day: int):
         ws.cell(row=r, column=1, value=tree_label)
         ws.cell(row=r, column=2, value=f"가지 {branch_no}")
         ws.cell(row=r, column=3, value=row["count"])
+        total_headcount += row["count"]
         for si in range(len(slot_labels)):
             line_id = row["slot_line"].get(si)
             if line_id is None:
@@ -478,6 +480,35 @@ def api_export_tracking(day: int):
                 cell.value = line_id
                 cell.fill = PatternFill("solid", fgColor=_line_fill_hex(line_id))
         r += 1
+
+    # 접어둔(닫은) 라인들: "하루 종일 뻔한 연속생산이라 편집 안 해도 됨"
+    # 이라고 사람이 이미 판단해둔 라인들이라, 그 라인의 첫 슬롯 인원이
+    # 하루 종일 그대로 그 라인에서 일한다고 가정하고 추적 그룹처럼
+    # 한 줄씩 같이 내보낸다(가지 개념은 없으므로 라인 이름을 그룹명으로
+    # 그대로 쓰고, 가지 칸은 비워둔다). 위 추적 그룹들과 구분되게 한 칸
+    # 띄우고 시작한다.
+    closed_lines = data.get("closed_lines") or []
+    grid = data.get("grid") or {}
+    if closed_lines:
+        r += 1
+        for line_id in closed_lines:
+            cells = grid.get(line_id) or []
+            headcount = cells[0].get("workers", 0) if cells else 0
+            total_headcount += headcount
+
+            ws.cell(row=r, column=1, value=line_id)
+            ws.cell(row=r, column=3, value=headcount)
+            for si in range(len(slot_labels)):
+                cell = ws.cell(row=r, column=4 + si)
+                cell.value = line_id
+                cell.alignment = Alignment(horizontal="center")
+                cell.fill = PatternFill("solid", fgColor=_line_fill_hex(line_id))
+            r += 1
+
+    # 맨 아래: 위에서 내보낸 모든 인원(추적 그룹 + 접힌 라인)의 총합.
+    r += 1
+    ws.cell(row=r, column=1, value="총 인원").font = header_font
+    ws.cell(row=r, column=3, value=total_headcount).font = header_font
 
     ws.column_dimensions["A"].width = 16
     ws.column_dimensions["B"].width = 10
@@ -497,7 +528,85 @@ def api_export_tracking(day: int):
     )
 
 
+def _print_ngrok_status(port: int) -> None:
+    """ngrok은 이 스크립트가 켜는 게 아니라 완전히 별개의 프로세스라서
+    (직접 실행/종료를 제어하지 않는다), 여기서는 ngrok의 로컬 관리
+    API(기본적으로 http://127.0.0.1:4040)에 물어봐서 "지금 이 포트로
+    연결된 터널이 있는지"만 확인해 알려준다. ngrok이 안 켜져 있거나
+    다른 포트를 물고 있어도 정상 동작에는 전혀 영향 없음(순수 안내용)."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels", timeout=1.5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        print(
+            f"[정보] ngrok 터널이 감지되지 않습니다(지금은 로컬(127.0.0.1)에서만 접속 가능) - "
+            f"외부에서 접속하려면 별도 터미널에서 `ngrok http {port}` 를 실행하세요."
+        )
+        return
+
+    tunnels = [
+        t for t in data.get("tunnels", [])
+        if t.get("config", {}).get("addr", "").endswith(f":{port}")
+    ]
+    if not tunnels:
+        print(f"[정보] ngrok은 실행 중이지만 포트 {port}로 연결된 터널은 없습니다(로컬에서만 접속 가능).")
+        return
+    print("[정보] ngrok 터널 감지됨 - 아래 주소로 외부에서도 접속 가능합니다:")
+    for t in tunnels:
+        print(f"       {t['public_url']}")
+
+
+def _kill_other_staffing_app_processes() -> None:
+    """이 프로세스 말고, 지금 떠 있는 다른 staffing_app.py 프로세스를
+    전부 찾아서 죽인다(자기 자신은 PID로 제외).
+
+    왜 필요한가: 이 스크립트는 시작할 때 엑셀을 다시 읽느라 ~2분이
+    걸리는데, 그동안은 아직 포트를 실제로 열지 않은 상태다. 그 사이에
+    또 이 스크립트를 실행하면(예: 실수로 두 번 켜거나, 이전 실행이
+    아직 로딩 중인 걸 모르고 새로 켜면) 여러 프로세스가 동시에 "로딩
+    중" 상태로 떠 있게 되고, 나중에 어느 게 먼저 로딩을 끝내고 포트를
+    잡느냐에 따라 결과가 갈린다 - 방금 새로 켠 프로세스가 아니라 훨씬
+    전에 켜뒀던(오래된 계획을 읽은) 프로세스가 뒤늦게 포트를 잡아버려서,
+    "분명 새로 껐다 켰는데 계속 예전 스케줄이 뜬다"는 매우 헷갈리는
+    문제가 실제로 발생했다(2026-07-21). 그래서 로딩을 시작하기 전에
+    항상 먼저 "나 말고 이 스크립트를 실행 중인 프로세스는 다 정리"부터
+    한다 - 그러면 언제나 "제일 마지막으로 실행한 게 이긴다"가 보장된다.
+    """
+    if os.name != "nt":
+        return  # 이 프로젝트는 Windows 환경 전용이라 다른 OS는 그냥 건너뜀
+    import subprocess
+
+    my_pid = os.getpid()
+    script_name = os.path.basename(__file__)
+    ps_query = (
+        f"Get-CimInstance Win32_Process -Filter \"Name = 'python.exe'\" | "
+        f"Where-Object {{ $_.CommandLine -like '*{script_name}*' -and $_.ProcessId -ne {my_pid} }} | "
+        f"Select-Object -ExpandProperty ProcessId"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_query],
+            capture_output=True, text=True, timeout=15,
+        )
+        pids = [int(x) for x in result.stdout.split() if x.strip().isdigit()]
+    except Exception as e:
+        print(f"[경고] 이전 프로세스 확인 중 오류(무시하고 계속 진행): {e}")
+        return
+
+    if not pids:
+        return
+    print(f"[정보] 이전에 남아있던 {script_name} 프로세스 {len(pids)}개(PID: {pids})를 정리합니다.")
+    for pid in pids:
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+
 def main():
+    _kill_other_staffing_app_processes()
+
     parser = argparse.ArgumentParser(description="30일 계획 결과를 놓고 하루치 인원 배치를 수작업으로 조정하는 로컬 웹 도구")
     parser.add_argument("--dir", default=None, help="line_schedule.csv/daily_workforce.csv가 있는 디렉터리")
     parser.add_argument("--port", type=int, default=5000)
@@ -548,6 +657,7 @@ def main():
     print(f"[정보] http://127.0.0.1:{args.port} 에서 접속하세요")
     if _PASSWORD:
         print("[정보] 비밀번호 보호가 켜져 있습니다(아이디는 아무거나, 비밀번호만 확인).")
+    _print_ngrok_status(args.port)
 
     if not args.no_browser:
         import threading

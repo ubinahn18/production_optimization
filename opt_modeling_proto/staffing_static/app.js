@@ -224,6 +224,7 @@ function renderGrid() {
 
   table.appendChild(tbody);
   drawFlowArrows();
+  highlightReturnTargetOnGrid(computeReturnTarget());
 }
 
 function idleCountAtSlot(slotIdx) {
@@ -535,7 +536,7 @@ function drawFlowArrows() {
   const table = document.getElementById("grid");
   if (!svg || !container || !table || !state) return;
 
-  svg.querySelectorAll(".flowArrowLine, .flowArrowLabel, .flowArrowHit, .flowArrowTrackHalo").forEach((el) => el.remove());
+  svg.querySelectorAll(".flowArrowLine, .flowArrowLabel, .flowArrowHit, .flowArrowTrackHalo, .flowArrowNextCandidate").forEach((el) => el.remove());
 
   const w = table.scrollWidth;
   const h = table.scrollHeight;
@@ -544,6 +545,17 @@ function drawFlowArrows() {
 
   const contRect = container.getBoundingClientRect();
   const maxT = state.slot_labels.length - 2;
+
+  // 지금 활성 추적 노드가 있으면, 거기서 바로 이어갈 수 있는(=srcLine와
+  // slotIdx가 정확히 그 노드의 현재 위치와 일치하는) 화살표들을 미리
+  // 계산해둔다 - 그 화살표만 눈에 띄게 강조해서, 여러 화살표가 겹쳐
+  // 있어도 "지금 클릭하면 추적이 이어질 화살표"를 바로 구분할 수 있게
+  // 한다(tryExtendTracking의 판단 조건과 정확히 같은 조건).
+  let activeNodeForHighlight = null;
+  if (activeTrackInfo) {
+    const tree = state.tracking[activeTrackInfo.treeId];
+    activeNodeForHighlight = tree ? tree.nodes[activeTrackInfo.nodeId] : null;
+  }
 
   // 지금 편집 중인 전환만이 아니라 하루 전체(모든 전환)의 화살표를 다
   // 같이 누적해서 보여준다 - 지금 보고 있는 전환만 진하게, 나머지는
@@ -555,12 +567,22 @@ function drawFlowArrows() {
       const dstTd = findGridCell(e.dstLine, t + 1);
       if (!srcTd || !dstTd) continue;
       const displayCount = arrowAvailableCount(e);
-      drawOneArrow(svg, contRect, container, srcTd, dstTd, e, t, displayCount, t === currentTransition);
+      // 표시 숫자가 0이 된 화살표(수동으로 다 줄였거나, 추적이 다
+      // 가져간 경우)는 아예 안 그린다 - 안 그러면 같은 자리에 숫자만
+      // 0인 화살표가 계속 겹쳐 남아서 진짜 화살표를 클릭하기 어려워진다.
+      // 실제 배정(edge.count)은 전혀 안 바뀜 - 순수 표시만 안 그리는 것.
+      if (displayCount <= 0) continue;
+      const isNextCandidate = !!(
+        activeNodeForHighlight
+        && activeNodeForHighlight.slotIdx === t
+        && activeNodeForHighlight.lineId === e.srcLine
+      );
+      drawOneArrow(svg, contRect, container, srcTd, dstTd, e, t, displayCount, t === currentTransition, isNextCandidate);
     }
   }
 }
 
-function drawOneArrow(svg, contRect, container, srcTd, dstTd, edge, transitionIdx, count, isCurrent) {
+function drawOneArrow(svg, contRect, container, srcTd, dstTd, edge, transitionIdx, count, isCurrent, isNextCandidate) {
   const edgeId = edge.id;
   const s = srcTd.getBoundingClientRect();
   const d = dstTd.getBoundingClientRect();
@@ -591,6 +613,16 @@ function drawOneArrow(svg, contRect, container, srcTd, dstTd, edge, transitionId
     svg.appendChild(halo);
   }
 
+  // 지금 활성 추적 노드에서 바로 이어갈 수 있는 화살표는(=다음에 클릭할
+  // 후보) 점선 하이라이트를 따로 얹어서, 겹쳐 있는 다른 화살표들 사이에서
+  // "이걸 누르면 추적이 이어진다"를 바로 구분할 수 있게 한다.
+  if (isNextCandidate) {
+    const candidateHalo = document.createElementNS(SVG_NS, "path");
+    candidateHalo.setAttribute("d", d3);
+    candidateHalo.setAttribute("class", "flowArrowNextCandidate");
+    svg.appendChild(candidateHalo);
+  }
+
   // 실제로 보이는 얇은 곡선 밑에, 클릭하기 쉽도록 두꺼운(투명) "히트
   // 영역" 패스를 하나 더 깔아둔다(얇은 2~3px 선은 마우스로 정확히
   // 맞추기 어려움).
@@ -610,9 +642,14 @@ function drawOneArrow(svg, contRect, container, srcTd, dstTd, edge, transitionId
   });
   svg.appendChild(hit);
 
+  // 다음 추적 후보 화살표는 지금 보고 있는 전환(탭)이 아니어도 옅게
+  // 죽이지 않는다 - 활성 노드 이후 전환이 사이드바에서 지금 안 보고
+  // 있는 탭일 수도 있는데, 그래도 "누르면 이어진다"는 눈에 띄어야 함.
+  const emphasize = isCurrent || isNextCandidate;
+
   const path = document.createElementNS(SVG_NS, "path");
   path.setAttribute("d", d3);
-  path.setAttribute("class", "flowArrowLine" + (isCurrent ? "" : " dim"));
+  path.setAttribute("class", "flowArrowLine" + (emphasize ? "" : " dim"));
   svg.appendChild(path);
 
   // 곡선의 실제 중간 지점(2차 베지어, t=0.5): 0.25*P0 + 0.5*P1 + 0.25*P2
@@ -622,7 +659,7 @@ function drawOneArrow(svg, contRect, container, srcTd, dstTd, edge, transitionId
   label.setAttribute("x", labelX);
   label.setAttribute("y", labelY);
   label.setAttribute("text-anchor", "middle");
-  label.setAttribute("class", "flowArrowLabel" + (isCurrent ? "" : " dim"));
+  label.setAttribute("class", "flowArrowLabel" + (emphasize ? "" : " dim"));
   label.textContent = String(count);
   svg.appendChild(label);
 }
@@ -682,6 +719,54 @@ function remainingForNode(tree, node) {
     if (child) used += child.count;
   }
   return node.count - used;
+}
+
+// 주어진 노드의 "부모부터" 위로 거슬러 올라가며, 아직 다 안 갈라진
+// (remainingForNode>0) 가장 가까운 조상을 찾는다 - "이 가지를 끝까지
+// 다 따라왔는데, 트리를 마저 완성하려면 어디로 돌아가야 하나"를 알려줄
+// 때 쓴다. 시작 노드 자신은 검사 대상에서 뺀다 - 아직 한 번도 안
+// 갈라진 리프는 childIds가 비어 있어서 remainingForNode가 항상 자기
+// count 전체와 같게 나오는데(자명하게 "다 안 갈라짐"), 이건 "아직
+// 못 끝낸 가지"가 아니라 그냥 "지금 여기 있다"는 뜻이라 돌아갈
+// 곳으로 치면 안 된다 - 실수로 자기 자신을 매번 답으로 골라버리는
+// 버그가 있었음(2026-07-21 실제로 확인됨).
+function findNearestIncompleteAncestor(tree, nodeId) {
+  const self = tree.nodes[nodeId];
+  let cur = self && self.parentId ? tree.nodes[self.parentId] : null;
+  while (cur) {
+    if (remainingForNode(tree, cur) > 0) return cur;
+    cur = cur.parentId ? tree.nodes[cur.parentId] : null;
+  }
+  return null;
+}
+
+// 활성 추적 노드를 기준으로 "돌아가야 할 지점"을 계산한다. 그리드
+// 강조(renderGrid)와 사이드바 강조(renderTrackingPanel)가 서로 어느
+// 쪽이 먼저 그려지든 항상 같은 기준을 쓰도록 여기 하나로 모아뒀다 -
+// 활성 노드 자신이 그 지점이면(=지금 있는 자리가 이미 안 갈라진
+// 상태) "돌아갈" 필요가 없으므로 null을 반환한다.
+function computeReturnTarget() {
+  if (!activeTrackInfo) return null;
+  const tree = state.tracking[activeTrackInfo.treeId];
+  if (!tree) return null;
+  const candidate = findNearestIncompleteAncestor(tree, activeTrackInfo.nodeId);
+  if (!candidate || candidate.id === activeTrackInfo.nodeId) return null;
+  return { treeId: activeTrackInfo.treeId, nodeId: candidate.id };
+}
+
+// 계산된 "돌아갈 지점"을 그리드 셀에 시각적으로 표시한다(이전 강조는
+// 먼저 지움 - renderGrid가 매번 표를 통째로 새로 그리므로, 지우는
+// 대상은 사실 항상 새로 그려진 빈 상태지만 방어적으로 남겨둠).
+function highlightReturnTargetOnGrid(returnTarget) {
+  document.querySelectorAll("#grid td.cell.trackReturnTarget").forEach((td) => {
+    td.classList.remove("trackReturnTarget");
+  });
+  if (!returnTarget) return;
+  const tree = state.tracking[returnTarget.treeId];
+  const node = tree && tree.nodes[returnTarget.nodeId];
+  if (!node) return;
+  const td = findGridCell(node.lineId, node.slotIdx);
+  if (td) td.classList.add("trackReturnTarget");
 }
 
 function tryExtendTracking(edge, transitionIdx) {
@@ -766,6 +851,7 @@ function startNewTrack() {
   pendingNewTrack = true;
   activeTrackInfo = null;
   updateTrackingButtonUI();
+  drawFlowArrows(); // 이전 활성 노드의 "다음 후보" 강조를 지운다
 }
 
 function updateTrackingButtonUI() {
@@ -780,6 +866,7 @@ function setActiveTrackNode(treeId, nodeId) {
   pendingNewTrack = false;
   updateTrackingButtonUI();
   renderTrackingPanel();
+  drawFlowArrows(); // 활성 노드가 바뀌면 "다음 후보" 화살표 강조도 다시 계산해야 함
 }
 
 function deleteTrackTree(treeId) {
@@ -802,6 +889,13 @@ function renderTrackingPanel() {
   const wrap = document.getElementById("trackingList");
   if (!wrap) return;
   wrap.innerHTML = "";
+
+  // 활성 노드 기준 "돌아갈 지점" - renderGrid에서도 독립적으로 같은
+  // 계산을 하지만(어느 쪽이 먼저 그려지든 항상 최신값이 반영되게),
+  // 여기서도 한 번 더 반영해서 그리드 강조와 항상 같은 상태를 보여준다.
+  const returnTarget = computeReturnTarget();
+  highlightReturnTargetOnGrid(returnTarget);
+
   for (const treeId of Object.keys(state.tracking)) {
     const tree = state.tracking[treeId];
     const box = document.createElement("div");
@@ -831,21 +925,22 @@ function renderTrackingPanel() {
 
     const rootUl = document.createElement("ul");
     rootUl.className = "trackNodeList";
-    rootUl.appendChild(renderTrackNodeItem(tree, tree.rootNodeId));
+    rootUl.appendChild(renderTrackNodeItem(tree, tree.rootNodeId, returnTarget));
     box.appendChild(rootUl);
 
     wrap.appendChild(box);
   }
 }
 
-function renderTrackNodeItem(tree, nodeId) {
+function renderTrackNodeItem(tree, nodeId, returnTarget) {
   const node = tree.nodes[nodeId];
   const li = document.createElement("li");
   const isActive = activeTrackInfo && activeTrackInfo.treeId === tree.id && activeTrackInfo.nodeId === nodeId;
-  li.className = "trackNode" + (isActive ? " active" : "");
+  const isReturnTarget = !!(returnTarget && returnTarget.treeId === tree.id && returnTarget.nodeId === nodeId);
+  li.className = "trackNode" + (isActive ? " active" : "") + (isReturnTarget ? " returnTarget" : "");
   const slotLabel = state.slot_labels[node.slotIdx] || `슬롯${node.slotIdx}`;
   const lineLabel = node.lineId === IDLE_KEY ? "미배치" : node.lineId;
-  li.textContent = `${node.count}명 @ ${lineLabel} (${slotLabel})`;
+  li.textContent = `${node.count}명 @ ${lineLabel} (${slotLabel})` + (isReturnTarget ? " ↩ 여기로 돌아가기" : "");
   li.title = "클릭하면 여기서부터 새 가지를 뻗을 수 있음(활성 노드로 지정)";
   li.addEventListener("click", (ev) => {
     ev.stopPropagation();
@@ -856,7 +951,7 @@ function renderTrackNodeItem(tree, nodeId) {
     const childUl = document.createElement("ul");
     childUl.className = "trackNodeList";
     for (const childId of node.childIds) {
-      childUl.appendChild(renderTrackNodeItem(tree, childId));
+      childUl.appendChild(renderTrackNodeItem(tree, childId, returnTarget));
     }
     li.appendChild(childUl);
   }
@@ -1039,6 +1134,22 @@ function renderEdgeList(edges, srcItems, dstItems) {
     del.title = "이 이동 삭제";
     del.addEventListener("click", () => deleteEdge(e.id));
     li.appendChild(del);
+
+    // 우클릭으로 화면 표시 숫자를 줄여둔 화살표는(특히 0까지 줄이면
+    // 그림에서 아예 안 그려지므로) 그림에서 다시 클릭할 방법이 없다 -
+    // 여기 목록에서 초기화할 수 있게 해준다(실제 배정은 항상 그대로라
+    // 이 목록의 count는 안 바뀌어 있었음 - 화면 표시만 원래대로 되돌림).
+    if (arrowDisplayReduction[e.id]) {
+      const resetBtn = document.createElement("span");
+      resetBtn.className = "edgeResetDisplay";
+      resetBtn.textContent = `표시 -${arrowDisplayReduction[e.id]} 초기화`;
+      resetBtn.title = "우클릭으로 줄여둔 화면 표시 숫자를 원래대로(실제 배정 그대로) 되돌립니다.";
+      resetBtn.addEventListener("click", () => {
+        delete arrowDisplayReduction[e.id];
+        renderAll();
+      });
+      li.appendChild(resetBtn);
+    }
 
     ul.appendChild(li);
   }
